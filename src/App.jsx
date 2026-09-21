@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
-import { OrbitControls } from '@react-three/drei'
+import { MeshRefractionMaterial, OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { MATERIALS, criticalAngle, leakageAssessment } from './optics.js'
+import { MATERIALS, MATERIAL_GROUPS, criticalAngle, leakageAssessment } from './optics.js'
 import { BUILTIN_DESIGNS, buildGemFromDesign, convertDesignGear, distanceThroughPoint, materializeDesign, measureGem, parseAsc, parseGem, serializeAsc } from './gemcad.js'
 import { traceFaceUp } from './raytrace.js'
 import { optimizePavilion } from './optimizer.js'
@@ -13,6 +13,8 @@ import { parseRoughMesh } from './roughMesh.js'
 import { evaluateDefects } from './defects.js'
 import { optimizeRoughPlacement } from './nesting.js'
 import { evenlySpacedIndexes, findGirdleTiers, setGirdleThickness } from './girdle.js'
+import { addPatternTiers, removePatternGroup } from './pattern.js'
+import { buildClosedGemGeometry, createStudioCubeTexture, RENDER_PROFILES, resolveRenderDevice } from './rendering.js'
 import './App.css'
 
 const clone = value => JSON.parse(JSON.stringify(value))
@@ -104,7 +106,7 @@ function Facet({ facet, ior, gemColor, selected, affected, editColor, finish = '
     result.setFromPoints(facet.points.map(point => new THREE.Vector3(...point)))
     return result
   }, [facet.points])
-  const color = editColor || (selected ? '#ffd56a' : affected ? '#bde7ff' : gemColor)
+  const color = selected ? '#ffd56a' : affected ? '#bde7ff' : editColor || gemColor
   const frosted = finish === 'frosted'
   return <group><mesh geometry={geometry} onClick={preview || !onSelect ? undefined : event => { event.stopPropagation(); onSelect(facet) }}>
     <meshPhysicalMaterial color={color} roughness={frosted ? .62 : preview ? 0.025 : 0.07} transmission={wireframe ? .12 : frosted ? .28 : preview ? 0.9 : selected ? 0.35 : 0.72}
@@ -113,7 +115,7 @@ function Facet({ facet, ior, gemColor, selected, affected, editColor, finish = '
   </mesh>{wireframe && <lineLoop geometry={outlineGeometry} renderOrder={4}><lineBasicMaterial color={selected ? '#ffd56a' : '#8bcfff'} transparent opacity={selected ? 1 : .82} depthTest/></lineLoop>}</group>
 }
 
-function GemModel({ model, selectedTierId, selectedFacet, ior, gemColor, tierColors = {}, facetColors = {}, tierFinishes = {}, facetFinishes = {}, hiddenTiers = {}, preview = false, showAppearance = false, wireframe = false, onSelect }) {
+function GemModel({ model, selectedTierId, selectedFacet, selectionScope = 'single', ior, gemColor, tierColors = {}, facetColors = {}, tierFinishes = {}, facetFinishes = {}, hiddenTiers = {}, preview = false, showAppearance = false, wireframe = false, onSelect }) {
   const tierCount = model.design.tiers.find(tier => tier.id === selectedTierId)?.indexes.length || 1
   const left = (selectedFacet - 1 + tierCount) % tierCount
   const right = (selectedFacet + 1) % tierCount
@@ -125,10 +127,29 @@ function GemModel({ model, selectedTierId, selectedFacet, ior, gemColor, tierCol
       gemColor={isGirdle && !preview ? '#6fa3bd' : gemColor}
       editColor={preview && !showAppearance ? '' : facetColors[facet.tier.id]?.[facet.facetIndex] || tierColors[facet.tier.id]}
       finish={facetFinishes[facet.tier.id]?.[facet.facetIndex] || tierFinishes[facet.tier.id] || 'polished'}
-      selected={!preview && sameTier && facet.facetIndex === selectedFacet}
-      affected={!preview && sameTier && (facet.facetIndex === left || facet.facetIndex === right)}
+      selected={!preview && sameTier && (selectionScope === 'tier' || facet.facetIndex === selectedFacet)}
+      affected={!preview && selectionScope !== 'tier' && sameTier && (facet.facetIndex === left || facet.facetIndex === right)}
       preview={preview} wireframe={wireframe} onSelect={onSelect} />
   })}</group>
+}
+
+function RealisticGem({ model, ior, dispersion, gemColor, bodyColorStrength, renderProfile, tierColors = {}, facetColors = {}, tierFinishes = {}, facetFinishes = {}, showAppearance = false }) {
+  const geometry = useMemo(() => buildClosedGemGeometry(model, { gemColor, bodyColorStrength, showAppearance, tierColors, facetColors, tierFinishes, facetFinishes }), [model, gemColor, bodyColorStrength, showAppearance, tierColors, facetColors, tierFinishes, facetFinishes])
+  const envMap = useMemo(() => createStudioCubeTexture(renderProfile.environmentSize), [renderProfile.environmentSize])
+  useEffect(() => () => geometry.dispose(), [geometry])
+  useEffect(() => () => envMap?.dispose(), [envMap])
+  if (!envMap) return null
+  const spectralSeparation = Math.min(.04, Math.max(0, dispersion) / Math.max(2, ior * 2))
+  return <mesh geometry={geometry}>
+    <MeshRefractionMaterial key={geometry.uuid} envMap={envMap} ior={ior} bounces={renderProfile.bounces} fresnel={.16}
+      aberrationStrength={spectralSeparation * renderProfile.dispersionScale} fastChroma color="#ffffff" vertexColors toneMapped />
+  </mesh>
+}
+
+function configureJewelryRenderer({ gl }) {
+  gl.outputColorSpace = THREE.SRGBColorSpace
+  gl.toneMapping = THREE.ACESFilmicToneMapping
+  gl.toneMappingExposure = 1.12
 }
 
 function RoughStone({ settings, modelScale, customMesh }) {
@@ -262,6 +283,7 @@ function App() {
     return readWorkspace() || { design: fallback }
   }, [])
   const initial = startup.design
+  const startupMaterial = MATERIALS[startup.material] ? startup.material : 'custom'
   const [design, setDesign] = useState(initial)
   const [originalDesign, setOriginalDesign] = useState(clone(initial))
   const [sourceFormat, setSourceFormat] = useState(startup.sourceFormat || 'ASC')
@@ -271,8 +293,10 @@ function App() {
   const [facetEdits, setFacetEdits] = useState(startup.facetEdits || {})
   const [selectedTierId, setSelectedTierId] = useState(startup.selectedTierId || chooseInitialTier(initial))
   const [selectedFacet, setSelectedFacet] = useState(startup.selectedFacet || 0)
-  const [material, setMaterial] = useState(MATERIALS[startup.material] ? startup.material : 'custom')
+  const [material, setMaterial] = useState(startupMaterial)
   const [ior, setIor] = useState(startup.ior || initial.ior)
+  const [dispersion, setDispersion] = useState(Number.isFinite(startup.dispersion) ? startup.dispersion : MATERIALS[startupMaterial].dispersion)
+  const [birefringence, setBirefringence] = useState(Number.isFinite(startup.birefringence) ? startup.birefringence : MATERIALS[startupMaterial].birefringence)
   const [gemColor, setGemColor] = useState(startup.gemColor || MATERIALS.custom.color)
   const [finishedWidth, setFinishedWidth] = useState(startup.finishedWidth || 10)
   const [density, setDensity] = useState(startup.density || MATERIALS.custom.density)
@@ -292,13 +316,16 @@ function App() {
   const [facetFinishes, setFacetFinishes] = useState(startup.facetFinishes || {})
   const [hiddenTiers, setHiddenTiers] = useState({})
   const [originalAppearance, setOriginalAppearance] = useState({ tierColors: clone(startup.tierColors || {}), facetColors: clone(startup.facetColors || {}), tierFinishes: clone(startup.tierFinishes || {}), facetFinishes: clone(startup.facetFinishes || {}) })
-  const [previewColors, setPreviewColors] = useState(true)
+  const [previewColors, setPreviewColors] = useState(Boolean(startup.previewColors))
+  const [bodyColorStrength, setBodyColorStrength] = useState(Number.isFinite(startup.bodyColorStrength) ? startup.bodyColorStrength : MATERIALS[startupMaterial].colorStrength)
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [renderDevice, setRenderDevice] = useState(['auto', 'mobile', 'desktop'].includes(startup.renderDevice) ? startup.renderDevice : 'auto')
   const [inspectorTab, setInspectorTab] = useState('facet')
   const [leftTab, setLeftTab] = useState('design')
   const [viewMode, setViewMode] = useState('perspective')
   const [wireframe, setWireframe] = useState(false)
   const [viewToolsOpen, setViewToolsOpen] = useState(true)
+  const [mobileWorkspaceTab, setMobileWorkspaceTab] = useState('viewer')
   const [history, setHistory] = useState({ past: [], future: [] })
   const [optimization, setOptimization] = useState(null)
   const [optimizing, setOptimizing] = useState(false)
@@ -313,9 +340,18 @@ function App() {
   const [cutTool, setCutTool] = useState('fine')
   const [cutDirection, setCutDirection] = useState('in')
   const [cutDragging, setCutDragging] = useState(false)
+  const [patternType, setPatternType] = useState('web')
+  const [patternSide, setPatternSide] = useState('pavilion')
+  const [patternRays, setPatternRays] = useState(8)
+  const [patternRings, setPatternRings] = useState(2)
+  const [patternRotation, setPatternRotation] = useState(0)
+  const [patternStrength, setPatternStrength] = useState(1.5)
+  const [patternFinish, setPatternFinish] = useState('alternate')
   const directCutStart = useRef(null)
 
   const selectedTier = design.tiers.find(tier => tier.id === selectedTierId) || design.tiers[0]
+  const resolvedRenderDevice = resolveRenderDevice(renderDevice)
+  const renderProfile = RENDER_PROFILES[resolvedRenderDevice]
   const selectedEdit = facetEdits[selectedTier?.id]?.[selectedFacet]
   const selectedAngle = selectedEdit?.angle ?? selectedTier?.angle ?? 0
   const selectedDepth = -(selectedEdit?.distanceDelta || 0) / .004
@@ -324,6 +360,8 @@ function App() {
     catch (error) { return { model: null, error: error.message } }
   }, [design, facetEdits])
   const selectedModelFacet = modelResult.model?.facets.find(facet => facet.tier.id === selectedTier?.id && facet.facetIndex === selectedFacet)
+  const patternGroups = [...new Set(design.tiers.map(tier => tier.patternGroup).filter(Boolean))]
+  const latestPatternGroup = patternGroups.at(-1)
   const meetLocked = Boolean(meetLock && meetLock.tierId === selectedTier?.id && meetLock.facetIndex === selectedFacet)
   const designFacetCount = design.tiers.filter(tier => Math.abs(tier.angle) < 89.95).reduce((sum, tier) => sum + tier.indexes.length, 0)
   const pavilionCandidates = design.tiers.filter(tier => tier.angle < -1 && tier.angle > -89.9)
@@ -373,12 +411,12 @@ function App() {
     setAutosaveStatus('保存中…')
     const timer = window.setTimeout(() => {
       try {
-        localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, gemColor, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, savedAt: Date.now() }))
+        localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, gemColor, bodyColorStrength, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, savedAt: Date.now() }))
         setAutosaveStatus('已自动保存')
       } catch { setAutosaveStatus('自动保存失败') }
     }, 500)
     return () => window.clearTimeout(timer)
-  }, [design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, gemColor, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId])
+  }, [design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, gemColor, bodyColorStrength, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice])
   useEffect(() => {
     const index = design.tiers.findIndex(tier => tier.id === selectedTierId)
     if (index >= 0) setCuttingStep(index)
@@ -459,6 +497,8 @@ function App() {
     setImportStatus(label)
     setMaterial('custom')
     setDensity(MATERIALS.custom.density)
+    setDispersion(MATERIALS.custom.dispersion)
+    setBirefringence(MATERIALS.custom.birefringence)
     setIor(next.ior)
     setGearTarget(next.gear)
     const nextAppearance = { tierColors: clone(appearance.tierColors || {}), facetColors: clone(appearance.facetColors || {}), tierFinishes: clone(appearance.tierFinishes || {}), facetFinishes: clone(appearance.facetFinishes || {}) }
@@ -783,7 +823,7 @@ function App() {
     setImportStatus(sourceFormat === 'ASC' ? '已恢复导入时设计' : '已恢复 GEM 原始设计')
   }
 
-  function saveWorkspaceNow() { try { localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, gemColor, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, savedAt: Date.now() })); setAutosaveStatus('已手动保存'); setImportStatus('当前工作区已保存到本机浏览器') } catch { setAutosaveStatus('保存失败'); setImportStatus('工作区保存失败：浏览器存储空间可能不足') } }
+  function saveWorkspaceNow() { try { localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, gemColor, bodyColorStrength, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, savedAt: Date.now() })); setAutosaveStatus('已手动保存'); setImportStatus('当前工作区已保存到本机浏览器') } catch { setAutosaveStatus('保存失败'); setImportStatus('工作区保存失败：浏览器存储空间可能不足') } }
 
   function exportAsc() {
     const output = serializeAsc(materializeDesign({ ...design, ior }, facetEdits), ior)
@@ -941,6 +981,64 @@ function App() {
     })
   }
 
+  function generatePattern() {
+    try {
+      checkpoint()
+      const result = addPatternTiers(design, facetEdits, {
+        type: patternType,
+        side: patternSide,
+        rays: patternRays,
+        rings: patternRings,
+        rotation: patternRotation,
+        strength: patternStrength,
+      })
+      setDesign(result.design)
+      setFacetEdits(result.edits)
+      setTierFinishes(current => {
+        const next = { ...current }
+        result.tierIds.forEach(id => { next[id] = patternFinish === 'frosted' ? 'frosted' : 'polished' })
+        return next
+      })
+      if (patternFinish === 'alternate') {
+        setFacetFinishes(current => {
+          const next = { ...current }
+          result.tierIds.forEach(id => {
+            const tier = result.design.tiers.find(item => item.id === id)
+            next[id] = Object.fromEntries(tier.indexes.map((_, index) => [index, index % 2 ? 'frosted' : 'polished']))
+          })
+          return next
+        })
+      }
+      setSelectedTierId(result.tierIds.at(-1))
+      setSelectedFacet(0)
+      setCutScope('tier')
+      setViewMode('quad')
+      setImportStatus(`已在当前${patternSide === 'pavilion' ? '亭部' : '冠部'}生成 ${result.tierIds.length} 层${patternType === 'web' ? '蛛网' : patternType === 'petal' ? '花瓣' : '星芒'}纹路；每层仍可独立编辑`)
+    } catch (error) {
+      setImportStatus(`纹路生成失败：${error.message}`)
+    }
+  }
+
+  function removeLatestPattern() {
+    if (!latestPatternGroup) return
+    checkpoint()
+    const result = removePatternGroup(design, facetEdits, latestPatternGroup)
+    const withoutRemoved = record => {
+      const next = { ...record }
+      result.removed.forEach(id => { delete next[id] })
+      return next
+    }
+    setDesign(result.design)
+    setFacetEdits(result.edits)
+    setTierColors(withoutRemoved)
+    setFacetColors(withoutRemoved)
+    setTierFinishes(withoutRemoved)
+    setFacetFinishes(withoutRemoved)
+    setSelectedTierId(chooseInitialTier(result.design))
+    setSelectedFacet(0)
+    setImportStatus(`已移除最近生成的纹路组（${result.removed.length} 层）`)
+  }
+
   function runPavilionOptimization() {
     setOptimizing(true)
     setOptimization(null)
@@ -973,15 +1071,21 @@ function App() {
   }
 
   return <div className="app">
-    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 4.2 · Fireworks Cut</div></div></header>
-    <main className="workspace">
+    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 4.8 · Mobile Studio</div></div></header>
+    <main className={`workspace mobile-${mobileWorkspaceTab}`}>
       <aside className="panel controls"><div className="sidebar-tabs"><button className={leftTab === 'design' ? 'active' : ''} onClick={() => setLeftTab('design')}>设计</button><button className={leftTab === 'rough' ? 'active' : ''} onClick={() => setLeftTab('rough')}>原石</button><button className={leftTab === 'material' ? 'active' : ''} onClick={() => setLeftTab('material')}>材料</button><button className={leftTab === 'output' ? 'active' : ''} onClick={() => setLeftTab('output')}>输出</button></div>
         <details className="project-actions"><summary><span>项目操作</span><small>{autosaveStatus}</small></summary><div><button onClick={saveWorkspaceNow}>保存工作区</button><button onClick={restoreDesign}>恢复当前设计</button><button onClick={undo} disabled={!history.past.length}>撤销修改</button></div></details>
         {leftTab === 'material' && <><div className="panel-heading"><h2>材料与外观</h2><span>IOR {ior.toFixed(3)}</span></div>
-        <label>宝石材料</label><select value={material} onChange={e => { const key = e.target.value; setMaterial(key); setIor(MATERIALS[key].ior); setDensity(MATERIALS[key].density); setGemColor(MATERIALS[key].color) }}>{Object.entries(MATERIALS).map(([key, value]) => <option key={key} value={key}>{value.name}</option>)}</select>
+        <label>宝石材料</label><select value={material} onChange={e => { const key = e.target.value; const next = MATERIALS[key]; setMaterial(key); setIor(next.ior); setDispersion(next.dispersion); setBirefringence(next.birefringence); setDensity(next.density); setGemColor(next.color); setBodyColorStrength(next.colorStrength) }}>{MATERIAL_GROUPS.map(group => <optgroup key={group.id} label={group.name}>{Object.entries(MATERIALS).filter(([, value]) => value.group === group.id).map(([key, value]) => <option key={key} value={key}>{value.name}</option>)}</optgroup>)}</select>
         <label>实际折射率（IOR）</label><input aria-label="折射率" type="number" min="1.01" max="3" step="0.001" value={ior} onChange={e => setIor(Math.min(3, Math.max(1.01, Number(e.target.value))))} />
+        <div className="compact-grid"><div><label>色散值</label><input aria-label="色散值" type="number" min="0" max=".25" step=".001" value={dispersion} onChange={event => setDispersion(Math.max(0, Math.min(.25, Number(event.target.value))))}/></div><div><label>双折射差</label><input aria-label="双折射差" type="number" min="0" max=".2" step=".001" value={birefringence} onChange={event => setBirefringence(Math.max(0, Math.min(.2, Number(event.target.value))))}/></div></div>
+        <div className="material-optics-note"><strong>{MATERIALS[material].optical}</strong><span>折射率范围 {MATERIALS[material].range} · 色散 {dispersion.toFixed(3)}{birefringence > 0 ? ` · 双折射 ${birefringence.toFixed(3)}` : ' · 无明显双折射'}</span></div>
         <label>宝石颜色</label><div className="color-control"><input aria-label="宝石颜色" type="color" value={gemColor} onChange={e => setGemColor(e.target.value)}/><span>{gemColor.toUpperCase()}</span></div>
-        <label className="visibility-toggle"><input type="checkbox" checked={previewColors} onChange={e => setPreviewColors(e.target.checked)}/> 效果窗显示分面配色</label>
+        <label>真实体色浓度：{Math.round(bodyColorStrength * 100)}%</label><input type="range" min="0" max="1" step=".01" value={bodyColorStrength} onChange={event => setBodyColorStrength(Number(event.target.value))}/>
+        <label className="visibility-toggle"><input type="checkbox" checked={previewColors} onChange={e => setPreviewColors(e.target.checked)}/> 教学模式：效果窗叠加分面配色</label>
+        <div className="color-mode-note"><strong>{previewColors ? '教学分面配色' : '真实体色预览'}</strong><span>{previewColors ? '已指定颜色的刻面会覆盖宝石体色，仅用于识别切割层。' : '使用中性黑白摄影棚，颜色按体色浓度减弱，不叠加选面标记。'}</span></div>
+        <label>GPU渲染设备</label><select value={renderDevice} onChange={event => setRenderDevice(event.target.value)}><option value="auto">自动检测（当前：{renderProfile.label}）</option><option value="mobile">手机端 · 流畅省电</option><option value="desktop">电脑端 · 高质量</option></select>
+        <div className="render-profile-note"><strong>{renderProfile.label}模式</strong><span>{renderProfile.bounces} 次内部反射 · 环境精度 {renderProfile.environmentSize}px · 最高 {renderProfile.dpr[1]}× 像素密度</span></div>
         <div className="compact-grid"><div><label>成品宽度（mm）</label><input type="number" min="0.1" max="1000" step="0.1" value={finishedWidth} onChange={e => setFinishedWidth(Math.max(.1, Number(e.target.value)))}/></div><div><label>密度（g/cm³）</label><input type="number" min="0.1" max="30" step="0.01" value={density} onChange={e => setDensity(Math.max(.1, Number(e.target.value)))}/></div></div>
         {measures && <div className="summary-card"><span>预计成品</span><strong>{(measures.length * modelScale).toFixed(2)} × {finishedWidth.toFixed(2)} × {(measures.depth * modelScale).toFixed(2)} mm</strong><small>约 {estimatedCarats.toFixed(2)} ct</small></div>}</>}
 
@@ -995,7 +1099,8 @@ function App() {
         {currentLibraryId.startsWith('local-') && <button className="secondary danger" onClick={removeFromLibrary}>从本机琢型库移除</button>}
         <label className="secondary file-button">导入或批量导入 .GEM / .ASC<input multiple type="file" accept=".gem,.asc,.txt" onChange={importDesign}/></label>
         </details>
-        <div className="status-card"><span>{importStatus}</span><small>{sourceFormat} · {design.gear} 齿 · {design.tiers.length} 个切割层</small></div></>}
+        <div className="status-card"><span>{importStatus}</span><small>{sourceFormat} · {design.gear} 齿 · {design.tiers.length} 个切割层</small></div>
+        <div className="local-data-note"><strong>数据按浏览器独立保存</strong><span>不同设备或浏览器互不共享；同一设备的同一浏览器会继续使用上次工作区。</span></div></>}
 
         {leftTab === 'rough' && <><div className="panel-heading"><h2>原石规划</h2><span>{ROUGH_SHAPES[rough.shape].name}</span></div>
         <label className="visibility-toggle"><input type="checkbox" checked={rough.visible} onChange={event => updateRough({ visible: event.target.checked })}/> 在工程视图显示原石</label>
@@ -1041,15 +1146,15 @@ function App() {
         <div className="viewport-header"><nav className="tool-rail" aria-label="工作工具"><button className={activeTool === 'select' ? 'active' : ''} onClick={() => setActiveTool('select')} title="选择刻面 (S)"><b>◇</b><span>选择</span><kbd>S</kbd></button><button className={activeTool === 'orbit' ? 'active' : ''} onClick={() => setActiveTool('orbit')} title="旋转视图 (O)"><b>↻</b><span>旋转</span><kbd>O</kbd></button><button className={activeTool === 'cut' ? 'active cut' : ''} disabled={!selectedModelFacet || meetLocked} onClick={toggleDirectCut} title="直接切割 (C)"><b>◩</b><span>切割</span><kbd>C</kbd></button></nav><div className="viewer-title"><span>{design.title || '未命名设计'} · {designFacetCount} 面</span><small>{activeTool === 'select' ? '单击刻面进行选择' : activeTool === 'orbit' ? '拖动旋转 · 滚轮缩放' : '沿黄色箭头拖动切割片'}</small>{rough.visible && !roughFit.fits && <b>原石穿出：{roughFit.outside} 个顶点在外</b>}{modelResult.error && <b>{modelResult.error}</b>}</div></div>
         <div className={`view-toolbar ${viewToolsOpen ? '' : 'collapsed'}`}><span className="toolbar-label">视图</span><div className="view-toolbar-actions"><button className="history-action" onClick={undo} disabled={!history.past.length}>撤销</button><button className="history-action" onClick={redo} disabled={!history.future.length}>重做</button><i/><button className={viewMode === 'perspective' ? 'active' : ''} onClick={() => setViewMode('perspective')}>透视</button><button className={viewMode === 'top' ? 'active' : ''} onClick={() => setViewMode('top')}>俯视</button><button className={viewMode === 'side' ? 'active' : ''} onClick={() => setViewMode('side')}>侧视</button><button className={viewMode === 'quad' ? 'active' : ''} onClick={() => setViewMode('quad')}>四视</button><button className={wireframe ? 'active' : ''} onClick={() => setWireframe(current => !current)}>线稿</button><button className={assistantOpen ? 'active' : ''} onClick={() => setAssistantOpen(current => !current)}>步骤</button><button className={previewOpen ? 'active' : ''} disabled={viewMode === 'quad'} onClick={() => setPreviewOpen(current => !current)}>效果窗</button></div><button className="toolbar-collapse" onClick={() => setViewToolsOpen(current => !current)} title={viewToolsOpen ? '收起视图工具' : '展开视图工具'}>{viewToolsOpen ? '收起' : '展开'}</button></div>
         {directCutMode && <div className={`direct-cut-hint ${cutDragging ? 'dragging' : ''}`}><b>{cutDragging ? '正在重算刻面交点' : '直接切割工具'}</b><span>{cutDragging ? '松开即可完成；按住 Shift 可精细移动' : '抓住蓝色切割片，沿黄色箭头拖动 · Shift 精调'}</span></div>}
-        {viewMode === 'quad' ? <div className="quad-view"><ModelViewport label="俯视 / Crown" camera={{ position:[0,7.2,.01], up:[0,0,-1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="侧视 / Side" camera={{ position:[7.2,0,.01], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="端视 / End" camera={{ position:[.01,0,7.2], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="亭部 / Pavilion" camera={{ position:[0,-7.2,.01], up:[0,0,1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/></div> : <ModelViewport key={viewMode} camera={viewCamera} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/>} 
-        {previewOpen && viewMode !== 'quad' ? <div className="effect-window"><div className="effect-title"><div><span>成品效果</span><small>面朝上 · {previewColors ? '分面配色' : '统一宝石色'}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
-          <div className="effect-canvas"><Canvas camera={{ position: [0, 11, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model: modelResult.model, selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, previewColors }}/><ambientLight intensity={1.1}/><hemisphereLight args={['#e7f6ff','#13263b',1.5]}/><directionalLight position={[4,8,4]} intensity={4}/><directionalLight position={[-4,5,-3]} intensity={2}/>{modelResult.model && <GemModel model={modelResult.model} {...{selectedTierId, selectedFacet, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes}} preview showAppearance={previewColors}/>}<OrbitControls enableDamping/></Canvas></div>
+        {viewMode === 'quad' ? <div className="quad-view"><ModelViewport label="俯视 / Crown" camera={{ position:[0,7.2,.01], up:[0,0,-1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="侧视 / Side" camera={{ position:[7.2,0,.01], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="端视 / End" camera={{ position:[.01,0,7.2], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="亭部 / Pavilion" camera={{ position:[0,-7.2,.01], up:[0,0,1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/></div> : <ModelViewport key={viewMode} camera={viewCamera} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/>} 
+        {previewOpen && viewMode !== 'quad' ? <div className="effect-window"><div className="effect-title"><div><span>真实折射效果</span><small>{renderProfile.label} · {renderProfile.bounces} 次内部反射 · {previewColors ? '分面配色' : '统一宝石色'}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
+          <div className="effect-canvas realistic"><Canvas dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={{ position: [0, 14.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model: modelResult.model, ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, tierFinishes, facetFinishes, previewColors, resolvedRenderDevice }}/>{modelResult.model && <RealisticGem model={modelResult.model} renderProfile={renderProfile} {...{ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, tierFinishes, facetFinishes}} showAppearance={previewColors}/>}<OrbitControls enableDamping/></Canvas></div>
         </div> : null}
         {assistantOpen && <div className="cutting-assistant"><button onClick={() => goToCuttingStep(cuttingStep - 1)} disabled={cuttingStep === 0}>‹</button><div><span>切磨步骤 {cuttingStep + 1} / {design.tiers.length}</span><strong>{activeCuttingTier.name} · {activeCuttingTier.angle.toFixed(2)}°</strong><small>齿号 {activeCuttingTier.indexes.join(' · ')}</small></div><button onClick={() => goToCuttingStep(cuttingStep + 1)} disabled={cuttingStep === design.tiers.length - 1}>›</button><label><input type="checkbox" checked={hideFutureTiers} onChange={event => setHideFutureTiers(event.target.checked)}/> 隐藏后续层</label></div>}
-        <div className="viewport-status"><span className={`tool-state ${activeTool}`}>{activeTool === 'select' ? '选择工具' : activeTool === 'orbit' ? '旋转工具' : '直接切割'}</span><span>{selectedTier.name} · 面 {selectedFacet + 1}</span><span>角度 {selectedAngle.toFixed(2)}°</span><span>切深 {selectedDepth.toFixed(2)}</span><em className={modelResult.error ? 'error' : ''}>{modelResult.error ? '几何错误' : '几何有效'}</em></div>
+        <div className="viewport-status"><span className={`tool-state ${activeTool}`}>{activeTool === 'select' ? '选择工具' : activeTool === 'orbit' ? '旋转工具' : '直接切割'}</span><span>{selectedTier.name} · {cutScope === 'tier' ? `整层 ${selectedTier.indexes.length} 面已选` : `面 ${selectedFacet + 1}`}</span><span>角度 {selectedAngle.toFixed(2)}°</span><span>切深 {selectedDepth.toFixed(2)}</span><em className={modelResult.error ? 'error' : ''}>{modelResult.error ? '几何错误' : '几何有效'}</em></div>
       </section>
 
-      <aside className="panel result"><div className="inspector-tabs"><button className={inspectorTab === 'facet' ? 'active' : ''} onClick={() => setInspectorTab('facet')}>刻面</button><button className={inspectorTab === 'girdle' ? 'active' : ''} onClick={() => setInspectorTab('girdle')}>腰围</button><button className={inspectorTab === 'optics' ? 'active' : ''} onClick={() => setInspectorTab('optics')}>光学</button><button className={inspectorTab === 'measure' ? 'active' : ''} onClick={() => setInspectorTab('measure')}>比例</button><button className={inspectorTab === 'check' ? 'active' : ''} onClick={() => setInspectorTab('check')}>检查</button></div>
+      <aside className="panel result"><div className="inspector-tabs"><button className={inspectorTab === 'facet' ? 'active' : ''} onClick={() => setInspectorTab('facet')}>刻面</button><button className={inspectorTab === 'pattern' ? 'active' : ''} onClick={() => setInspectorTab('pattern')}>纹路</button><button className={inspectorTab === 'girdle' ? 'active' : ''} onClick={() => setInspectorTab('girdle')}>腰围</button><button className={inspectorTab === 'optics' ? 'active' : ''} onClick={() => setInspectorTab('optics')}>光学</button><button className={inspectorTab === 'measure' ? 'active' : ''} onClick={() => setInspectorTab('measure')}>比例</button><button className={inspectorTab === 'check' ? 'active' : ''} onClick={() => setInspectorTab('check')}>检查</button></div>
         {inspectorTab === 'facet' && <><div className="panel-heading"><h2>刻面与图层</h2><span>{selectedTier.name} · No.{selectedFacet + 1}</span></div>
         <div className={`design-mode ${design.symmetryFolds === 1 && !design.symmetryMirror ? 'free' : ''}`}><div><span>设计模式</span><strong>{design.symmetryFolds === 1 && !design.symmetryMirror ? '自由不对称' : `${design.symmetryFolds} 重对称${design.symmetryMirror ? ' · 镜像' : ''}`}</strong></div>{!(design.symmetryFolds === 1 && !design.symmetryMirror) && <button onClick={enableFreeDesign}>解除对称</button>}</div>
         <label>当前切割层</label><select value={selectedTier.id} onChange={e => { setSelectedTierId(e.target.value); setSelectedFacet(0) }}>{design.tiers.map((tier, index) => <option key={tier.id} value={tier.id}>{index + 1}. {tier.name} · {tier.indexes.length} 面</option>)}</select>
@@ -1083,6 +1188,24 @@ function App() {
         <p className="legend">黄色为当前刻面，浅蓝为相邻刻面。几何修改会实时重新计算共享交点。</p>
         <details className="cut-chart"><summary>完整切割步骤表（{design.tiers.length} 层）</summary>{design.tiers.map((tier, index) => <button key={tier.id} className={tier.id === selectedTier.id ? 'tier-row active' : 'tier-row'} onClick={() => { setSelectedTierId(tier.id); setSelectedFacet(0) }}><span>{index + 1}. {tier.name}</span><b>{tier.angle.toFixed(2)}°</b><small>{tier.indexes.join(' · ')}</small>{tier.instructions && <em>{tier.instructions}</em>}</button>)}</details></>}
 
+        {inspectorTab === 'pattern' && <><div className="panel-heading"><h2>自定义纹路设计器</h2><span>沿用当前外形</span></div>
+          <div className="pattern-intro"><strong>{design.title || '当前设计'}</strong><span>在现有宝石上增加真实平面刻面，不会把异形轮廓替换成圆形。</span></div>
+          <label>纹路结构</label><div className="pattern-type-grid">
+            <button className={patternType === 'star' ? 'active' : ''} onClick={() => setPatternType('star')}><b>✦</b><span>放射星芒</span><small>单层射线</small></button>
+            <button className={patternType === 'web' ? 'active' : ''} onClick={() => setPatternType('web')}><b>◎</b><span>蜘蛛网</span><small>多层交错</small></button>
+            <button className={patternType === 'petal' ? 'active' : ''} onClick={() => { setPatternType('petal'); setPatternRings(current => Math.max(2, current)) }}><b>❀</b><span>花瓣</span><small>内外错位</small></button>
+          </div>
+          <div className="compact-grid"><div><label>切割区域</label><select value={patternSide} onChange={event => setPatternSide(event.target.value)}><option value="pavilion">亭部纹路</option><option value="crown">冠部纹路</option></select></div><div><label>表面效果</label><select value={patternFinish} onChange={event => setPatternFinish(event.target.value)}><option value="alternate">光面 / 磨砂交替</option><option value="polished">全部光面</option><option value="frosted">全部磨砂</option></select></div></div>
+          <div className="compact-grid"><div><label>射线数量</label><input type="number" min="3" max="24" step="1" value={patternRays} onChange={event => setPatternRays(Math.max(3, Math.min(24, Math.round(Number(event.target.value) || 3))))}/></div><div><label>纹路层数</label><input type="number" min={patternType === 'petal' ? 2 : 1} max="4" step="1" disabled={patternType === 'star'} value={patternType === 'star' ? 1 : patternRings} onChange={event => setPatternRings(Math.max(patternType === 'petal' ? 2 : 1, Math.min(4, Math.round(Number(event.target.value) || 1))))}/></div></div>
+          <label>旋转方位（齿）：{Number(patternRotation).toFixed(2)}</label><input type="range" min="0" max={design.gear} step="0.25" value={patternRotation} onChange={event => setPatternRotation(Number(event.target.value))}/>
+          <label>切入强度：{Number(patternStrength).toFixed(2)}%</label><input type="range" min="0.15" max="6" step="0.05" value={patternStrength} onChange={event => setPatternStrength(Number(event.target.value))}/>
+          <div className="pattern-summary"><span>将要生成</span><strong>{patternRays} 射线 · {patternType === 'star' ? 1 : Math.max(patternType === 'petal' ? 2 : 1, patternRings)} 层 · {patternSide === 'pavilion' ? '亭部' : '冠部'}</strong><small>{patternType === 'web' ? '通过多圈交错刻面形成蛛网式反光纹路' : patternType === 'petal' ? '通过内外错位刻面形成花瓣轮廓' : '通过一圈定向刻面形成放射星芒'}</small></div>
+          <button className="secondary primary-action" onClick={generatePattern}>在当前外形生成真实刻面</button>
+          <button className="secondary" disabled={!latestPatternGroup} onClick={() => setInspectorTab('facet')}>转到“刻面”继续逐面微调</button>
+          <button className="secondary danger" disabled={!latestPatternGroup} onClick={removeLatestPattern}>移除最近生成的纹路</button>
+          <p className="legend">生成后纹路会加入完整切割步骤。可在“刻面”中选择整层联动或单面编辑，并继续调整角度、方向、切深、颜色和表面效果。</p>
+        </>}
+
         {inspectorTab === 'girdle' && <><div className="panel-heading"><h2>腰围与上下腰线</h2><span>{girdleThicknessMm.toFixed(2)} mm · {girdleThicknessRatio.toFixed(1)}%</span></div>
         {girdleTiers.girdle && girdleTiers.upper && girdleTiers.lower ? <>
           <div className={`girdle-health ${girdleThicknessRatio < 1.5 || girdleThicknessRatio > 6 ? 'warning' : 'ok'}`}><span>当前腰厚</span><strong>{girdleThicknessMm.toFixed(2)} mm</strong><small>成品宽度占比 {girdleThicknessRatio.toFixed(2)}%{girdleThicknessRatio < 1.5 ? ' · 偏薄，崩腰风险较高' : girdleThicknessRatio > 6 ? ' · 偏厚，可能影响亮度与重量分配' : ' · 位于常用检查范围'}</small></div>
@@ -1096,7 +1219,8 @@ function App() {
         </> : <div className="status-card"><span>当前设计缺少独立腰围、上腰或下腰层</span><small>可在“刻面 → 高级图层参数”中建立对应层后再集中调整。</small></div>}</>}
 
         {inspectorTab === 'optics' && <><div className="panel-heading"><h2>光学检查</h2><span>{MATERIALS[material].name} · IOR {ior.toFixed(3)}</span></div>
-        <Result label="材料" value={MATERIALS[material].name}/><Result label="折射率" value={ior.toFixed(3)}/><Result label="临界角" value={`${critical.toFixed(2)}°`}/><Result label="参考亭角" value={`${pavilionAngle.toFixed(2)}°`}/><Result label="安全余量" value={`${leakage.margin >= 0 ? '+' : ''}${leakage.margin.toFixed(2)}°`}/>
+        <Result label="材料" value={MATERIALS[material].name}/><Result label="折射率" value={ior.toFixed(3)}/><Result label="色散" value={dispersion.toFixed(3)}/><Result label="双折射" value={birefringence ? `${birefringence.toFixed(3)} · ${MATERIALS[material].optical}` : '无明显双折射'}/><Result label="临界角" value={`${critical.toFixed(2)}°`}/><Result label="参考亭角" value={`${pavilionAngle.toFixed(2)}°`}/><Result label="安全余量" value={`${leakage.margin >= 0 ? '+' : ''}${leakage.margin.toFixed(2)}°`}/>
+        {birefringence >= .02 && <div className="birefringence-warning"><strong>可见双折射提示</strong><span>该材料可能出现亭部刻面重影。当前GPU火彩按RGB色散近似，尚未模拟晶轴方向相关的两束偏振光。</span></div>}
         <div className={`risk ${leakage.level}`}><span>亭部漏光风险</span><strong>{leakage.label}</strong><p>{leakage.detail}</p></div>
         <button className="secondary primary-action" disabled={optimizing || !modelResult.model} onClick={runPavilionOptimization}>{optimizing ? '正在搜索优化方案…' : '分析并推荐亭角'}</button>
         {optimization && <div className="optimizer-card"><div><span>推荐整体调整</span><strong>{optimization.best.delta >= 0 ? '+' : ''}{optimization.best.delta.toFixed(2)}°</strong></div><div className="optimizer-metrics"><span>返回光<br/><b>{optimization.baseline.trace.returnPercent.toFixed(1)}% → {optimization.best.trace.returnPercent.toFixed(1)}%</b></span><span>漏光<br/><b>{optimization.baseline.trace.leakagePercent.toFixed(1)}% → {optimization.best.trace.leakagePercent.toFixed(1)}%</b></span></div><small>已比较 {optimization.tested} 个方案；角度变化时同步修正中心距以近似保持腰围交线。</small><button className="secondary" disabled={Math.abs(optimization.best.delta) < .001} onClick={applyPavilionOptimization}>{Math.abs(optimization.best.delta) < .001 ? '当前已是搜索范围内最佳' : '应用推荐方案'}</button></div>}
@@ -1113,6 +1237,7 @@ function App() {
         <p className="disclaimer">本检查用于提前发现几何风险；实际生产仍需结合材料解理、设备精度、抛光余量与实物缺陷复核。</p></>}
       </aside>
     </main>
+    <nav className="mobile-workspace-nav" aria-label="手机工作区"><button className={mobileWorkspaceTab === 'viewer' ? 'active' : ''} onClick={() => setMobileWorkspaceTab('viewer')}><b>◇</b><span>模型</span></button><button className={mobileWorkspaceTab === 'controls' ? 'active' : ''} onClick={() => setMobileWorkspaceTab('controls')}><b>☰</b><span>设计与材料</span></button><button className={mobileWorkspaceTab === 'result' ? 'active' : ''} onClick={() => setMobileWorkspaceTab('result')}><b>◫</b><span>刻面与光学</span></button></nav>
   </div>
 }
 

@@ -1,7 +1,9 @@
-import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
 
+// https://vite.dev/config/
 export default defineConfig({
-  base: '/gem-cut-designer/',
+  // Relative assets work on both a GitHub Pages project URL and local previews.
+  base: './',
   plugins: [react()],
 })

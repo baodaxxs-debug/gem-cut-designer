@@ -4,8 +4,22 @@
 
 当前版本包含圆明亮式和 8 射线烟花切等内置设计。烟花切提供亭部星芒强调面、整层联动切割，以及光面/磨砂表面效果。
 
+## 本地运行
+
+```bash
+npm install
+npm run dev
+```
+
+## 检查与构建
+
+```bash
+npm test
+npm run build
+```
+
 ## 在线发布
 
-项目通过 GitHub Actions 自动构建并发布到 GitHub Pages。
+推送到 `main` 或 `master` 分支后，`.github/workflows/deploy-pages.yml` 会测试、构建并发布 `dist` 到 GitHub Pages。
 
 本程序用于设计辅助与教学演示。正式切磨前仍需结合材料、原石、设备精度和实物缺陷复核。

@@ -1,0 +1,7 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { parseObjRough, parseStlRough } from '../src/roughMesh.js'
+import { pointInRough } from '../src/rough.js'
+const cubeObj = `v -1 -1 -1\nv 1 -1 -1\nv 1 1 -1\nv -1 1 -1\nv -1 -1 1\nv 1 -1 1\nv 1 1 1\nv -1 1 1\nf 1 4 3 2\nf 5 6 7 8\nf 1 2 6 5\nf 4 8 7 3\nf 1 5 8 4\nf 2 3 7 6`
+test('OBJ 原石网格可解析、归一化并用于内外检测', () => { const mesh = parseObjRough(cubeObj, 'cube.obj'); assert.equal(mesh.triangleCount, 12); assert.deepEqual(mesh.dimensions, { length: 2, height: 2, width: 2 }); const settings = { shape: 'scan', length: 10, height: 10, width: 10, offsetX: 0, offsetY: 0, offsetZ: 0, rotationX: 0, rotationY: 0, rotationZ: 0 }; assert.equal(pointInRough([0, 0, 0], settings, mesh).inside, true); assert.equal(pointInRough([6, 0, 0], settings, mesh).inside, false) })
+test('ASCII STL 原石网格可解析', () => { const stl = `solid tetra\nfacet normal 0 0 -1 outer loop vertex 0 0 0 vertex 0 1 0 vertex 1 0 0 endloop endfacet\nfacet normal 0 -1 0 outer loop vertex 0 0 0 vertex 1 0 0 vertex 0 0 1 endloop endfacet\nfacet normal -1 0 0 outer loop vertex 0 0 0 vertex 0 0 1 vertex 0 1 0 endloop endfacet\nfacet normal 1 1 1 outer loop vertex 1 0 0 vertex 0 1 0 vertex 0 0 1 endloop endfacet\nendsolid tetra`; const mesh = parseStlRough(new TextEncoder().encode(stl).buffer, 'tetra.stl'); assert.equal(mesh.triangleCount, 4); assert.equal(mesh.closedEstimate, true) })
