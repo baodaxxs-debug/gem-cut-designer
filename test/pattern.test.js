@@ -29,3 +29,17 @@ test('蛛网与花瓣模式可生成多层并可整体移除', () => {
     assert.equal(removed.design.tiers.length, source.tiers.length)
   }
 })
+
+test('樱花切快捷方案生成可编辑的五瓣三层刻面', () => {
+  const source = parseAsc(BUILTIN_DESIGNS[0].asc)
+  const result = addPatternTiers(source, {}, { preset: 'sakura', side: 'pavilion', strength: 2.2, groupId: 'test-sakura' })
+  const model = buildGemFromDesign(result.design, result.edits)
+  assert.equal(result.tierIds.length, 3)
+  for (const id of result.tierIds) {
+    const tier = result.design.tiers.find(item => item.id === id)
+    assert.equal(tier.patternPreset, 'sakura')
+    assert.match(tier.name, /樱花切/)
+    assert.ok(model.facets.some(facet => facet.tier.id === id))
+    assert.ok(result.edits[id])
+  }
+})

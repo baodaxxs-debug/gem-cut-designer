@@ -30,16 +30,17 @@ function indexesFor(gear, rays, rotation, doubled, staggered) {
   })
 }
 
-function tierName(type, ring, total) {
-  const base = type === 'web' ? '蛛网连接层' : type === 'petal' ? '花瓣纹路层' : '放射星芒层'
+function tierName(type, ring, total, preset) {
+  const base = preset === 'sakura' ? '樱花切刻面' : type === 'web' ? '蛛网连接层' : type === 'petal' ? '花瓣纹路层' : '放射星芒层'
   return total > 1 ? `${base} ${ring + 1}` : base
 }
 
 export function addPatternTiers(design, facetEdits = {}, options = {}) {
-  const type = ['star', 'web', 'petal'].includes(options.type) ? options.type : 'star'
+  const preset = options.preset === 'sakura' ? 'sakura' : null
+  const type = preset === 'sakura' ? 'petal' : ['star', 'web', 'petal'].includes(options.type) ? options.type : 'star'
   const side = options.side === 'crown' ? 'crown' : 'pavilion'
-  const rays = clamp(Math.round(Number(options.rays) || 8), 3, 24)
-  const requestedRings = clamp(Math.round(Number(options.rings) || 1), 1, 4)
+  const rays = clamp(Math.round(Number(options.rays) || (preset === 'sakura' ? 5 : 8)), 3, 24)
+  const requestedRings = clamp(Math.round(Number(options.rings) || (preset === 'sakura' ? 3 : 1)), 1, 4)
   const rings = type === 'star' ? 1 : type === 'petal' ? Math.max(2, requestedRings) : requestedRings
   const rotation = Number(options.rotation) || 0
   const strength = clamp(Number(options.strength) || 1.2, .15, 6)
@@ -67,7 +68,7 @@ export function addPatternTiers(design, facetEdits = {}, options = {}) {
     const distance = supports.reduce((sum, value) => sum + value, 0) / supports.length
     const tier = {
       id: tierId,
-      name: tierName(type, ring, rings),
+      name: tierName(type, ring, rings, preset),
       rawName: `PX${ring + 1}`,
       code: `PX${ring + 1}`,
       angle,
@@ -76,6 +77,7 @@ export function addPatternTiers(design, facetEdits = {}, options = {}) {
       instructions: `${rays} 射线 · ${side === 'pavilion' ? '亭部' : '冠部'} · 纹路生成器`,
       patternGroup: groupId,
       patternType: type,
+      ...(preset && { patternPreset: preset }),
     }
     const boundaryIndex = side === 'pavilion'
       ? nextDesign.tiers.findIndex(item => item.angle >= 0)

@@ -92,7 +92,7 @@ function materializeAppearance(design, edits, tierColors, facetColors, tierFinis
   return { tierColors: nextTierColors, facetColors: nextFacetColors, tierFinishes: nextTierFinishes, facetFinishes: nextFacetFinishes }
 }
 
-function Facet({ facet, ior, gemColor, selected, affected, editColor, finish = 'polished', preview = false, wireframe = false, onSelect }) {
+function Facet({ facet, ior, gemColor, selected, affected, editColor, finish = 'polished', preview = false, technicalPreview = false, wireframe = false, onSelect }) {
   const geometry = useMemo(() => {
     const vertices = []
     for (let i = 1; i < facet.points.length - 1; i += 1) vertices.push(...facet.points[0], ...facet.points[i], ...facet.points[i + 1])
@@ -108,14 +108,14 @@ function Facet({ facet, ior, gemColor, selected, affected, editColor, finish = '
   }, [facet.points])
   const color = selected ? '#ffd56a' : affected ? '#bde7ff' : editColor || gemColor
   const frosted = finish === 'frosted'
-  return <group><mesh geometry={geometry} onClick={preview || !onSelect ? undefined : event => { event.stopPropagation(); onSelect(facet) }}>
-    <meshPhysicalMaterial color={color} roughness={frosted ? .62 : preview ? 0.025 : 0.07} transmission={wireframe ? .12 : frosted ? .28 : preview ? 0.9 : selected ? 0.35 : 0.72}
+  return <group><mesh geometry={geometry} onClick={preview || technicalPreview || !onSelect ? undefined : event => { event.stopPropagation(); onSelect(facet) }}>
+    {technicalPreview ? <meshStandardMaterial color={editColor || gemColor} roughness={frosted ? .92 : .34} metalness={.08} side={THREE.DoubleSide}/> : <meshPhysicalMaterial color={color} roughness={frosted ? .62 : preview ? 0.025 : 0.07} transmission={wireframe ? .12 : frosted ? .28 : preview ? 0.9 : selected ? 0.35 : 0.72}
       thickness={preview ? 2.6 : 1.8} ior={ior} transparent opacity={wireframe ? .1 : frosted ? .9 : preview ? 0.98 : 0.96} flatShading depthWrite={!wireframe} side={THREE.DoubleSide}
-      emissive={!preview && selected ? '#b06d00' : '#000000'} emissiveIntensity={!preview && selected ? 0.28 : 0} />
-  </mesh>{wireframe && <lineLoop geometry={outlineGeometry} renderOrder={4}><lineBasicMaterial color={selected ? '#ffd56a' : '#8bcfff'} transparent opacity={selected ? 1 : .82} depthTest/></lineLoop>}</group>
+      emissive={!preview && selected ? '#b06d00' : '#000000'} emissiveIntensity={!preview && selected ? 0.28 : 0} />}
+  </mesh>{(wireframe || technicalPreview) && <lineLoop geometry={outlineGeometry} renderOrder={4}><lineBasicMaterial color={technicalPreview ? '#9adfff' : selected ? '#ffd56a' : '#8bcfff'} transparent opacity={technicalPreview ? .48 : selected ? 1 : .82} depthTest/></lineLoop>}</group>
 }
 
-function GemModel({ model, selectedTierId, selectedFacet, selectionScope = 'single', ior, gemColor, tierColors = {}, facetColors = {}, tierFinishes = {}, facetFinishes = {}, hiddenTiers = {}, preview = false, showAppearance = false, wireframe = false, onSelect }) {
+function GemModel({ model, selectedTierId, selectedFacet, selectionScope = 'single', ior, gemColor, tierColors = {}, facetColors = {}, tierFinishes = {}, facetFinishes = {}, hiddenTiers = {}, preview = false, technicalPreview = false, focusPatternGroup = null, showAppearance = false, wireframe = false, onSelect }) {
   const tierCount = model.design.tiers.find(tier => tier.id === selectedTierId)?.indexes.length || 1
   const left = (selectedFacet - 1 + tierCount) % tierCount
   const right = (selectedFacet + 1) % tierCount
@@ -125,11 +125,11 @@ function GemModel({ model, selectedTierId, selectedFacet, selectionScope = 'sing
     const isGirdle = Math.abs(facet.angle) > 89.95
     return <Facet key={`${facet.tier.id}-${facet.facetIndex}-${i}`} facet={facet} ior={ior}
       gemColor={isGirdle && !preview ? '#6fa3bd' : gemColor}
-      editColor={preview && !showAppearance ? '' : facetColors[facet.tier.id]?.[facet.facetIndex] || tierColors[facet.tier.id]}
+      editColor={technicalPreview && focusPatternGroup ? facet.tier.patternGroup === focusPatternGroup ? '#e6a9d6' : '#587f9f' : preview && !showAppearance ? '' : facetColors[facet.tier.id]?.[facet.facetIndex] || tierColors[facet.tier.id]}
       finish={facetFinishes[facet.tier.id]?.[facet.facetIndex] || tierFinishes[facet.tier.id] || 'polished'}
-      selected={!preview && sameTier && (selectionScope === 'tier' || facet.facetIndex === selectedFacet)}
-      affected={!preview && selectionScope !== 'tier' && sameTier && (facet.facetIndex === left || facet.facetIndex === right)}
-      preview={preview} wireframe={wireframe} onSelect={onSelect} />
+      selected={!preview && !technicalPreview && sameTier && (selectionScope === 'tier' || facet.facetIndex === selectedFacet)}
+      affected={!preview && !technicalPreview && selectionScope !== 'tier' && sameTier && (facet.facetIndex === left || facet.facetIndex === right)}
+      preview={preview} technicalPreview={technicalPreview} wireframe={wireframe} onSelect={onSelect} />
   })}</group>
 }
 
@@ -319,6 +319,7 @@ function App() {
   const [previewColors, setPreviewColors] = useState(Boolean(startup.previewColors))
   const [bodyColorStrength, setBodyColorStrength] = useState(Number.isFinite(startup.bodyColorStrength) ? startup.bodyColorStrength : MATERIALS[startupMaterial].colorStrength)
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [previewMode, setPreviewMode] = useState('optical')
   const [renderDevice, setRenderDevice] = useState(['auto', 'mobile', 'desktop'].includes(startup.renderDevice) ? startup.renderDevice : 'auto')
   const [inspectorTab, setInspectorTab] = useState('facet')
   const [leftTab, setLeftTab] = useState('design')
@@ -386,7 +387,7 @@ function App() {
   const roughFit = useMemo(() => evaluateRoughFit(modelResult.model, modelScale, rough, roughMesh), [modelResult.model, modelScale, rough, roughMesh])
   const defectReport = useMemo(() => evaluateDefects(modelResult.model, modelScale, rough, defects), [modelResult.model, modelScale, rough, defects])
   const productionReport = useMemo(() => modelResult.model && measures ? validateForProduction(design, modelResult.model, measures, roughFit, defectReport) : null, [design, modelResult.model, measures, roughFit, defectReport])
-  const viewCamera = viewMode === 'top' ? { position: [0, 7.2, .01], up: [0, 0, -1], fov: 34 } : viewMode === 'side' ? { position: [7.2, 0, .01], up: [0, 1, 0], fov: 34 } : { position: [6.5, 4.5, 7.5], fov: 38 }
+  const viewCamera = viewMode === 'top' ? { position: [0, 11.5, .01], up: [0, 0, -1], fov: 34 } : viewMode === 'side' ? { position: [11.5, 0, .01], up: [0, 1, 0], fov: 34 } : { position: [6.5, 4.5, 7.5], fov: 38 }
   const renderedHiddenTiers = useMemo(() => {
     const next = { ...hiddenTiers }
     if (assistantOpen && hideFutureTiers) design.tiers.slice(cuttingStep + 1).forEach(tier => { next[tier.id] = true })
@@ -981,25 +982,23 @@ function App() {
     })
   }
 
-  function generatePattern() {
+  function generatePattern(preset = null) {
     try {
       checkpoint()
+      const settings = preset === 'sakura'
+        ? { type: 'petal', preset: 'sakura', side: 'pavilion', rays: 5, rings: 3, rotation: 0, strength: 2.2 }
+        : { type: patternType, side: patternSide, rays: patternRays, rings: patternRings, rotation: patternRotation, strength: patternStrength }
       const result = addPatternTiers(design, facetEdits, {
-        type: patternType,
-        side: patternSide,
-        rays: patternRays,
-        rings: patternRings,
-        rotation: patternRotation,
-        strength: patternStrength,
+        ...settings,
       })
       setDesign(result.design)
       setFacetEdits(result.edits)
       setTierFinishes(current => {
         const next = { ...current }
-        result.tierIds.forEach(id => { next[id] = patternFinish === 'frosted' ? 'frosted' : 'polished' })
+        result.tierIds.forEach(id => { next[id] = preset === 'sakura' ? 'polished' : patternFinish === 'frosted' ? 'frosted' : 'polished' })
         return next
       })
-      if (patternFinish === 'alternate') {
+      if (preset === 'sakura' || patternFinish === 'alternate') {
         setFacetFinishes(current => {
           const next = { ...current }
           result.tierIds.forEach(id => {
@@ -1011,9 +1010,13 @@ function App() {
       }
       setSelectedTierId(result.tierIds.at(-1))
       setSelectedFacet(0)
-      setCutScope('tier')
-      setViewMode('quad')
-      setImportStatus(`已在当前${patternSide === 'pavilion' ? '亭部' : '冠部'}生成 ${result.tierIds.length} 层${patternType === 'web' ? '蛛网' : patternType === 'petal' ? '花瓣' : '星芒'}纹路；每层仍可独立编辑`)
+      setCutScope(preset === 'sakura' ? 'single' : 'tier')
+      setViewMode('top')
+      setPreviewOpen(true)
+      setPreviewMode('cut')
+      setImportStatus(preset === 'sakura'
+        ? `已生成 5 瓣、3 层樱花切试作刻面；可在亭部视角检查切面，并继续逐面微调`
+        : `已在当前${settings.side === 'pavilion' ? '亭部' : '冠部'}生成 ${result.tierIds.length} 层${settings.type === 'web' ? '蛛网' : settings.type === 'petal' ? '花瓣' : '星芒'}纹路；每层仍可独立编辑`)
     } catch (error) {
       setImportStatus(`纹路生成失败：${error.message}`)
     }
@@ -1071,7 +1074,7 @@ function App() {
   }
 
   return <div className="app">
-    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 4.8 · Mobile Studio</div></div></header>
+    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 4.9 · Cut Preview</div></div></header>
     <main className={`workspace mobile-${mobileWorkspaceTab}`}>
       <aside className="panel controls"><div className="sidebar-tabs"><button className={leftTab === 'design' ? 'active' : ''} onClick={() => setLeftTab('design')}>设计</button><button className={leftTab === 'rough' ? 'active' : ''} onClick={() => setLeftTab('rough')}>原石</button><button className={leftTab === 'material' ? 'active' : ''} onClick={() => setLeftTab('material')}>材料</button><button className={leftTab === 'output' ? 'active' : ''} onClick={() => setLeftTab('output')}>输出</button></div>
         <details className="project-actions"><summary><span>项目操作</span><small>{autosaveStatus}</small></summary><div><button onClick={saveWorkspaceNow}>保存工作区</button><button onClick={restoreDesign}>恢复当前设计</button><button onClick={undo} disabled={!history.past.length}>撤销修改</button></div></details>
@@ -1144,17 +1147,17 @@ function App() {
 
       <section className="viewer">
         <div className="viewport-header"><nav className="tool-rail" aria-label="工作工具"><button className={activeTool === 'select' ? 'active' : ''} onClick={() => setActiveTool('select')} title="选择刻面 (S)"><b>◇</b><span>选择</span><kbd>S</kbd></button><button className={activeTool === 'orbit' ? 'active' : ''} onClick={() => setActiveTool('orbit')} title="旋转视图 (O)"><b>↻</b><span>旋转</span><kbd>O</kbd></button><button className={activeTool === 'cut' ? 'active cut' : ''} disabled={!selectedModelFacet || meetLocked} onClick={toggleDirectCut} title="直接切割 (C)"><b>◩</b><span>切割</span><kbd>C</kbd></button></nav><div className="viewer-title"><span>{design.title || '未命名设计'} · {designFacetCount} 面</span><small>{activeTool === 'select' ? '单击刻面进行选择' : activeTool === 'orbit' ? '拖动旋转 · 滚轮缩放' : '沿黄色箭头拖动切割片'}</small>{rough.visible && !roughFit.fits && <b>原石穿出：{roughFit.outside} 个顶点在外</b>}{modelResult.error && <b>{modelResult.error}</b>}</div></div>
-        <div className={`view-toolbar ${viewToolsOpen ? '' : 'collapsed'}`}><span className="toolbar-label">视图</span><div className="view-toolbar-actions"><button className="history-action" onClick={undo} disabled={!history.past.length}>撤销</button><button className="history-action" onClick={redo} disabled={!history.future.length}>重做</button><i/><button className={viewMode === 'perspective' ? 'active' : ''} onClick={() => setViewMode('perspective')}>透视</button><button className={viewMode === 'top' ? 'active' : ''} onClick={() => setViewMode('top')}>俯视</button><button className={viewMode === 'side' ? 'active' : ''} onClick={() => setViewMode('side')}>侧视</button><button className={viewMode === 'quad' ? 'active' : ''} onClick={() => setViewMode('quad')}>四视</button><button className={wireframe ? 'active' : ''} onClick={() => setWireframe(current => !current)}>线稿</button><button className={assistantOpen ? 'active' : ''} onClick={() => setAssistantOpen(current => !current)}>步骤</button><button className={previewOpen ? 'active' : ''} disabled={viewMode === 'quad'} onClick={() => setPreviewOpen(current => !current)}>效果窗</button></div><button className="toolbar-collapse" onClick={() => setViewToolsOpen(current => !current)} title={viewToolsOpen ? '收起视图工具' : '展开视图工具'}>{viewToolsOpen ? '收起' : '展开'}</button></div>
+        <div className={`view-toolbar ${viewToolsOpen ? '' : 'collapsed'}`}><span className="toolbar-label">视图</span><div className="view-toolbar-actions"><button className="history-action" onClick={undo} disabled={!history.past.length}>撤销</button><button className="history-action" onClick={redo} disabled={!history.future.length}>重做</button><i/><button className={viewMode === 'perspective' ? 'active' : ''} onClick={() => setViewMode('perspective')}>透视</button><button className={viewMode === 'top' ? 'active' : ''} onClick={() => setViewMode('top')}>俯视</button><button className={viewMode === 'side' ? 'active' : ''} onClick={() => setViewMode('side')}>侧视</button><button className={viewMode === 'quad' ? 'active' : ''} onClick={() => setViewMode('quad')}>四视</button><button className={wireframe ? 'active' : ''} onClick={() => setWireframe(current => !current)}>线稿</button><button className={assistantOpen ? 'active' : ''} onClick={() => setAssistantOpen(current => !current)}>步骤</button><button className={previewOpen ? 'active' : ''} onClick={() => { setPreviewOpen(current => !current); setMobileWorkspaceTab('result') }}>效果预览</button></div><button className="toolbar-collapse" onClick={() => setViewToolsOpen(current => !current)} title={viewToolsOpen ? '收起视图工具' : '展开视图工具'}>{viewToolsOpen ? '收起' : '展开'}</button></div>
         {directCutMode && <div className={`direct-cut-hint ${cutDragging ? 'dragging' : ''}`}><b>{cutDragging ? '正在重算刻面交点' : '直接切割工具'}</b><span>{cutDragging ? '松开即可完成；按住 Shift 可精细移动' : '抓住蓝色切割片，沿黄色箭头拖动 · Shift 精调'}</span></div>}
-        {viewMode === 'quad' ? <div className="quad-view"><ModelViewport label="俯视 / Crown" camera={{ position:[0,7.2,.01], up:[0,0,-1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="侧视 / Side" camera={{ position:[7.2,0,.01], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="端视 / End" camera={{ position:[.01,0,7.2], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="亭部 / Pavilion" camera={{ position:[0,-7.2,.01], up:[0,0,1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/></div> : <ModelViewport key={viewMode} camera={viewCamera} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/>} 
-        {previewOpen && viewMode !== 'quad' ? <div className="effect-window"><div className="effect-title"><div><span>真实折射效果</span><small>{renderProfile.label} · {renderProfile.bounces} 次内部反射 · {previewColors ? '分面配色' : '统一宝石色'}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
-          <div className="effect-canvas realistic"><Canvas dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={{ position: [0, 14.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model: modelResult.model, ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, tierFinishes, facetFinishes, previewColors, resolvedRenderDevice }}/>{modelResult.model && <RealisticGem model={modelResult.model} renderProfile={renderProfile} {...{ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, tierFinishes, facetFinishes}} showAppearance={previewColors}/>}<OrbitControls enableDamping/></Canvas></div>
-        </div> : null}
+        {viewMode === 'quad' ? <div className="quad-view"><ModelViewport label="俯视 / Crown" camera={{ position:[0,11.5,.01], up:[0,0,-1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="侧视 / Side" camera={{ position:[11.5,0,.01], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="端视 / End" camera={{ position:[.01,0,11.5], up:[0,1,0], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/><ModelViewport label="亭部 / Pavilion" camera={{ position:[0,-11.5,.01], up:[0,0,1], fov:34 }} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/></div> : <ModelViewport key={viewMode} camera={viewCamera} model={modelResult.model} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectionScope: cutScope, ior, gemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet }}/>} 
         {assistantOpen && <div className="cutting-assistant"><button onClick={() => goToCuttingStep(cuttingStep - 1)} disabled={cuttingStep === 0}>‹</button><div><span>切磨步骤 {cuttingStep + 1} / {design.tiers.length}</span><strong>{activeCuttingTier.name} · {activeCuttingTier.angle.toFixed(2)}°</strong><small>齿号 {activeCuttingTier.indexes.join(' · ')}</small></div><button onClick={() => goToCuttingStep(cuttingStep + 1)} disabled={cuttingStep === design.tiers.length - 1}>›</button><label><input type="checkbox" checked={hideFutureTiers} onChange={event => setHideFutureTiers(event.target.checked)}/> 隐藏后续层</label></div>}
         <div className="viewport-status"><span className={`tool-state ${activeTool}`}>{activeTool === 'select' ? '选择工具' : activeTool === 'orbit' ? '旋转工具' : '直接切割'}</span><span>{selectedTier.name} · {cutScope === 'tier' ? `整层 ${selectedTier.indexes.length} 面已选` : `面 ${selectedFacet + 1}`}</span><span>角度 {selectedAngle.toFixed(2)}°</span><span>切深 {selectedDepth.toFixed(2)}</span><em className={modelResult.error ? 'error' : ''}>{modelResult.error ? '几何错误' : '几何有效'}</em></div>
       </section>
 
-      <aside className="panel result"><div className="inspector-tabs"><button className={inspectorTab === 'facet' ? 'active' : ''} onClick={() => setInspectorTab('facet')}>刻面</button><button className={inspectorTab === 'pattern' ? 'active' : ''} onClick={() => setInspectorTab('pattern')}>纹路</button><button className={inspectorTab === 'girdle' ? 'active' : ''} onClick={() => setInspectorTab('girdle')}>腰围</button><button className={inspectorTab === 'optics' ? 'active' : ''} onClick={() => setInspectorTab('optics')}>光学</button><button className={inspectorTab === 'measure' ? 'active' : ''} onClick={() => setInspectorTab('measure')}>比例</button><button className={inspectorTab === 'check' ? 'active' : ''} onClick={() => setInspectorTab('check')}>检查</button></div>
+      <aside className="panel result">{previewOpen && <div className="effect-window"><div className="effect-title"><div><span>效果预览</span><small>{previewMode === 'cut' ? `${selectedTier.angle < -1 ? '亭部' : '冠部'}刻面 · 粉色高亮新纹路` : `${renderProfile.label} · 光学近似`}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
+          <div className="effect-mode-tabs"><button className={previewMode === 'cut' ? 'active' : ''} onClick={() => setPreviewMode('cut')}>刻面纹路</button><button className={previewMode === 'optical' ? 'active' : ''} onClick={() => setPreviewMode('optical')}>光学近似</button></div>
+          <div className="effect-canvas realistic"><Canvas key={`${previewMode}-${previewMode === 'cut' && selectedTier.angle < -1 ? 'pavilion' : 'crown'}`} dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={previewMode === 'cut' && selectedTier.angle < -1 ? { position: [0, -7, .01], up: [0, 0, 1], fov: 42 } : { position: [0, 8.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model: modelResult.model, ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, tierFinishes, facetFinishes, previewColors, previewMode, resolvedRenderDevice }}/><ambientLight intensity={1.6}/><directionalLight position={[5,-9,6]} intensity={2.3}/><directionalLight position={[5,9,6]} intensity={1.4}/>{modelResult.model && (previewMode === 'cut' ? <GemModel model={modelResult.model} technicalPreview focusPatternGroup={latestPatternGroup} ior={ior} gemColor={gemColor} tierColors={previewColors ? tierColors : {}} facetColors={previewColors ? facetColors : {}} tierFinishes={tierFinishes} facetFinishes={facetFinishes}/> : <RealisticGem model={modelResult.model} renderProfile={renderProfile} {...{ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, facetFinishes, tierFinishes}} showAppearance={previewColors}/>) }<OrbitControls enableDamping/></Canvas></div>
+        </div>}<div className="inspector-tabs"><button className={inspectorTab === 'facet' ? 'active' : ''} onClick={() => setInspectorTab('facet')}>刻面</button><button className={inspectorTab === 'pattern' ? 'active' : ''} onClick={() => setInspectorTab('pattern')}>纹路</button><button className={inspectorTab === 'girdle' ? 'active' : ''} onClick={() => setInspectorTab('girdle')}>腰围</button><button className={inspectorTab === 'optics' ? 'active' : ''} onClick={() => setInspectorTab('optics')}>光学</button><button className={inspectorTab === 'measure' ? 'active' : ''} onClick={() => setInspectorTab('measure')}>比例</button><button className={inspectorTab === 'check' ? 'active' : ''} onClick={() => setInspectorTab('check')}>检查</button></div>
         {inspectorTab === 'facet' && <><div className="panel-heading"><h2>刻面与图层</h2><span>{selectedTier.name} · No.{selectedFacet + 1}</span></div>
         <div className={`design-mode ${design.symmetryFolds === 1 && !design.symmetryMirror ? 'free' : ''}`}><div><span>设计模式</span><strong>{design.symmetryFolds === 1 && !design.symmetryMirror ? '自由不对称' : `${design.symmetryFolds} 重对称${design.symmetryMirror ? ' · 镜像' : ''}`}</strong></div>{!(design.symmetryFolds === 1 && !design.symmetryMirror) && <button onClick={enableFreeDesign}>解除对称</button>}</div>
         <label>当前切割层</label><select value={selectedTier.id} onChange={e => { setSelectedTierId(e.target.value); setSelectedFacet(0) }}>{design.tiers.map((tier, index) => <option key={tier.id} value={tier.id}>{index + 1}. {tier.name} · {tier.indexes.length} 面</option>)}</select>
@@ -1190,6 +1193,7 @@ function App() {
 
         {inspectorTab === 'pattern' && <><div className="panel-heading"><h2>自定义纹路设计器</h2><span>沿用当前外形</span></div>
           <div className="pattern-intro"><strong>{design.title || '当前设计'}</strong><span>在现有宝石上增加真实平面刻面，不会把异形轮廓替换成圆形。</span></div>
+          <div className="pattern-preset"><div><strong>樱花切试作</strong><small>一键加入 5 瓣、3 层交错亭部刻面；生成后可逐层、逐面修改。</small></div><button onClick={() => generatePattern('sakura')}>生成樱花切</button></div>
           <label>纹路结构</label><div className="pattern-type-grid">
             <button className={patternType === 'star' ? 'active' : ''} onClick={() => setPatternType('star')}><b>✦</b><span>放射星芒</span><small>单层射线</small></button>
             <button className={patternType === 'web' ? 'active' : ''} onClick={() => setPatternType('web')}><b>◎</b><span>蜘蛛网</span><small>多层交错</small></button>
@@ -1200,7 +1204,7 @@ function App() {
           <label>旋转方位（齿）：{Number(patternRotation).toFixed(2)}</label><input type="range" min="0" max={design.gear} step="0.25" value={patternRotation} onChange={event => setPatternRotation(Number(event.target.value))}/>
           <label>切入强度：{Number(patternStrength).toFixed(2)}%</label><input type="range" min="0.15" max="6" step="0.05" value={patternStrength} onChange={event => setPatternStrength(Number(event.target.value))}/>
           <div className="pattern-summary"><span>将要生成</span><strong>{patternRays} 射线 · {patternType === 'star' ? 1 : Math.max(patternType === 'petal' ? 2 : 1, patternRings)} 层 · {patternSide === 'pavilion' ? '亭部' : '冠部'}</strong><small>{patternType === 'web' ? '通过多圈交错刻面形成蛛网式反光纹路' : patternType === 'petal' ? '通过内外错位刻面形成花瓣轮廓' : '通过一圈定向刻面形成放射星芒'}</small></div>
-          <button className="secondary primary-action" onClick={generatePattern}>在当前外形生成真实刻面</button>
+          <button className="secondary primary-action" onClick={() => generatePattern()}>在当前外形生成真实刻面</button>
           <button className="secondary" disabled={!latestPatternGroup} onClick={() => setInspectorTab('facet')}>转到“刻面”继续逐面微调</button>
           <button className="secondary danger" disabled={!latestPatternGroup} onClick={removeLatestPattern}>移除最近生成的纹路</button>
           <p className="legend">生成后纹路会加入完整切割步骤。可在“刻面”中选择整层联动或单面编辑，并继续调整角度、方向、切深、颜色和表面效果。</p>
