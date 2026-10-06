@@ -2,8 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { BUILTIN_DESIGNS, COMPEAR_125_ASC, CUBE_ILLUSION_TRIANGLE_ASC, FIREWORKS_ROUND_ASC, STANDARD_ROUND_BRILLIANT_ASC, buildGemFromDesign, convertDesignGear, distanceThroughPoint, materializeDesign, measureGem, parseAsc, serializeAsc } from '../src/gemcad.js'
 import { traceFaceUp } from '../src/raytrace.js'
-import { optimizePavilion, shiftPavilion } from '../src/optimizer.js'
+import { optimizeCrown, optimizePavilion, shiftCrown, shiftPavilion } from '../src/optimizer.js'
 import { serializeDxf, uniqueEdges } from '../src/diagram.js'
+import { packOpticalPlanes } from '../src/gpuOptics.js'
 
 test('标准圆明亮式可建成封闭的 73 面模型', () => {
   const design = parseAsc(STANDARD_ROUND_BRILLIANT_ASC)
@@ -86,6 +87,18 @@ test('面朝上光线追踪返回有限结果', () => {
   assert.ok(result.leakagePercent >= 0 && result.leakagePercent <= 100)
 })
 
+test('GPU光学预览把最终有效刻面打包为半空间平面', () => {
+  const model = buildGemFromDesign(parseAsc(STANDARD_ROUND_BRILLIANT_ASC))
+  const result = packOpticalPlanes(model)
+  assert.equal(result.count, model.facets.length)
+  assert.equal(result.packed.length, 128 * 4)
+  model.facets.forEach((facet, index) => {
+    const normal = Array.from(result.packed.slice(index * 4, index * 4 + 3))
+    assert.ok(Math.abs(Math.hypot(...normal) - 1) < 1e-6)
+    assert.ok(Math.abs(result.packed[index * 4 + 3] - facet.d) < 1e-6)
+  })
+})
+
 test('梨形示例保持约 1.25 长宽比', () => {
   const model = buildGemFromDesign(parseAsc(COMPEAR_125_ASC))
   assert.equal(model.facets.length, 67)
@@ -122,6 +135,17 @@ test('亭角优化器比较候选方案且不会降低评分', () => {
   assert.equal(result.tested, 7)
   assert.ok(result.best.score >= result.baseline.score)
   assert.ok(buildGemFromDesign(result.best.design).facets.length > 60)
+})
+
+test('冠角优化器保留台面和亭部并比较有效候选方案', () => {
+  const design = shiftCrown(parseAsc(STANDARD_ROUND_BRILLIANT_ASC), -2)
+  const result = optimizeCrown(design, 1.76, { range: 2, step: 1, resolution: 7 })
+  assert.equal(result.tested, 5)
+  assert.ok(result.best.score >= result.baseline.score)
+  assert.ok(buildGemFromDesign(result.best.design).facets.length > 60)
+  design.tiers.forEach((tier, index) => {
+    if (tier.angle <= 1 || tier.angle >= 89.9) assert.equal(result.best.design.tiers[index].angle, tier.angle)
+  })
 })
 
 test('DXF 只导出真实刻面边界并包含俯视与侧视图层', () => {
