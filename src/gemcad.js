@@ -1,3 +1,5 @@
+import { applyVGrooves } from './vGroove.js'
+
 const EPSILON = 1e-6
 
 export const STANDARD_ROUND_BRILLIANT_ASC = `GemCad 5.0
@@ -303,7 +305,7 @@ function orderOnPlane(points, normal) {
   })
 }
 
-export function buildGemFromDesign(design, edits = {}) {
+function buildGemByIntersections(design, edits = {}) {
   const planes = design.tiers.flatMap(tier => tier.indexes.map((index, facetIndex) => {
     const edit = (edits[tier.id] || edits[tier.code])?.[facetIndex]
     return planeFromFacet(edit?.angle ?? tier.angle, index, design.gear, tier.distance + (edit?.distanceDelta ?? 0), tier, facetIndex, design.gearDirection)
@@ -326,7 +328,92 @@ export function buildGemFromDesign(design, edits = {}) {
     facet.points = facet.points.map(point => point.map(value => value * scale))
     facet.d *= scale
   })
-  return { design, facets, vertexCount: vertices.length, scale }
+  return { design, facets, vertexCount: vertices.length, scale, solver: 'plane-intersections' }
+}
+
+function cubeFaces(radius) {
+  const r = radius
+  return [
+    [[r,-r,-r],[r,-r,r],[r,r,r],[r,r,-r]],
+    [[-r,-r,r],[-r,-r,-r],[-r,r,-r],[-r,r,r]],
+    [[-r,r,-r],[r,r,-r],[r,r,r],[-r,r,r]],
+    [[-r,-r,r],[r,-r,r],[r,-r,-r],[-r,-r,-r]],
+    [[-r,-r,r],[-r,r,r],[r,r,r],[r,-r,r]],
+    [[r,-r,-r],[r,r,-r],[-r,r,-r],[-r,-r,-r]],
+  ].map(points => ({ points, plane: null }))
+}
+
+function uniquePoints(points, tolerance) {
+  const result = []
+  points.forEach(point => {
+    if (!result.some(existing => Math.hypot(...existing.map((value, axis) => value - point[axis])) <= tolerance)) result.push(point)
+  })
+  return result
+}
+
+function clipPolygon(points, plane, tolerance, intersections) {
+  const clipped = []
+  for (let index = 0; index < points.length; index += 1) {
+    const start = points[index], end = points[(index + 1) % points.length]
+    const startDistance = dot(plane.n, start) - plane.d
+    const endDistance = dot(plane.n, end) - plane.d
+    const startInside = startDistance <= tolerance, endInside = endDistance <= tolerance
+    if (startInside) clipped.push(start)
+    if (startInside !== endInside) {
+      const amount = startDistance / (startDistance - endDistance)
+      const crossing = start.map((value, axis) => value + (end[axis] - value) * amount)
+      clipped.push(crossing)
+      intersections.push(crossing)
+    }
+  }
+  return uniquePoints(clipped, tolerance)
+}
+
+function buildGemByClipping(design, edits = {}) {
+  const planes = design.tiers.flatMap(tier => tier.indexes.map((index, facetIndex) => {
+    const edit = (edits[tier.id] || edits[tier.code])?.[facetIndex]
+    return planeFromFacet(edit?.angle ?? tier.angle, index, design.gear, tier.distance + (edit?.distanceDelta ?? 0), tier, facetIndex, design.gearDirection)
+  }))
+  if (planes.length < 4) throw new Error('切割平面不足，无法形成封闭宝石')
+  const radius = Math.max(1, ...planes.map(plane => Math.abs(plane.d))) * 32
+  const tolerance = Math.max(EPSILON, radius * 1e-9)
+  let faces = cubeFaces(radius)
+
+  for (const plane of planes) {
+    const intersections = []
+    const clippedFaces = []
+    for (const face of faces) {
+      const points = clipPolygon(face.points, plane, tolerance, intersections)
+      if (points.length >= 3) clippedFaces.push({ ...face, points })
+    }
+    const cap = uniquePoints(intersections, tolerance * 4)
+    if (cap.length >= 3) clippedFaces.push({ points: orderOnPlane(cap, plane.n), plane })
+    faces = clippedFaces
+    if (!faces.length) throw new Error('当前切割平面移除了全部几何')
+  }
+
+  if (faces.some(face => !face.plane)) throw new Error('当前切割平面没有形成封闭宝石')
+  const facets = faces.filter(face => face.plane && face.points.length >= 3).map(face => ({ ...face.plane, points: orderOnPlane(uniquePoints(face.points, tolerance * 4), face.plane.n) }))
+  const vertices = uniquePoints(facets.flatMap(facet => facet.points), tolerance * 4)
+  if (!vertices.length || !facets.length) throw new Error('当前角度或层位没有形成封闭宝石，请恢复该层参数')
+  const maxRadius = Math.max(...vertices.map(([x,,z]) => Math.hypot(x,z)))
+  if (!Number.isFinite(maxRadius) || maxRadius < EPSILON) throw new Error('当前设计的宽度无效')
+  const scale = 2.4 / maxRadius
+  facets.forEach(facet => {
+    facet.points = facet.points.map(point => point.map(value => value * scale))
+    facet.d *= scale
+  })
+  return { design, facets, vertexCount: vertices.length, scale, solver: 'incremental-clipping' }
+}
+
+export function buildGemFromDesign(design, edits = {}) {
+  let model
+  try { model = buildGemByClipping(design, edits) }
+  catch (clippingError) {
+    try { model = { ...buildGemByIntersections(design, edits), solverFallback: clippingError.message } }
+    catch { throw clippingError }
+  }
+  return applyVGrooves(model, design.vGrooves || [])
 }
 
 export function buildGemFromAsc(text, edits = {}) {
@@ -422,11 +509,15 @@ export function measureGem(model) {
   const crown = Math.max(0, bounds[1].max - girdleTop)
   const pavilion = Math.max(0, girdleBottom - bounds[1].min)
   const girdle = Math.max(0, girdleTop - girdleBottom)
-  const volume = model.facets.reduce((sum, facet) => {
-    let area = 0
-    for (let i = 1; i < facet.points.length - 1; i += 1) area += triangleArea(facet.points[0], facet.points[i], facet.points[i + 1])
-    return sum + area * Math.abs(facet.d) / 3
+  const signedVolume = model.facets.reduce((sum, facet) => {
+    for (let index = 1; index < facet.points.length - 1; index += 1) {
+      let [a, b, c] = [facet.points[0], facet.points[index], facet.points[index + 1]]
+      if (dot(cross(b.map((value, axis) => value - a[axis]), c.map((value, axis) => value - a[axis])), facet.n) < 0) [b, c] = [c, b]
+      sum += dot(a, cross(b, c)) / 6
+    }
+    return sum
   }, 0)
+  const volume = Math.abs(signedVolume)
   return {
     length, width, depth: spanY, crown, pavilion, girdle, girdleTop, girdleBottom, volume,
     lengthToWidth: length / width,

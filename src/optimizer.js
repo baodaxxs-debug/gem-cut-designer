@@ -2,6 +2,7 @@ import { buildGemFromDesign } from './gemcad.js'
 import { traceFaceUp } from './raytrace.js'
 
 const isPavilionTier = tier => tier.angle < -1 && tier.angle > -89.9
+const isCrownTier = tier => tier.angle > 1 && tier.angle < 89.9
 
 export function shiftPavilion(design, deltaDegrees) {
   return {
@@ -13,6 +14,20 @@ export function shiftPavilion(design, deltaDegrees) {
       const nextTilt = nextAngle * Math.PI / 180
       const radialMeet = tier.distance / Math.max(1e-6, Math.sin(oldTilt))
       return { ...tier, angle: -nextAngle, distance: radialMeet * Math.sin(nextTilt) }
+    }),
+  }
+}
+
+export function shiftCrown(design, deltaDegrees) {
+  return {
+    ...design,
+    tiers: design.tiers.map(tier => {
+      if (!isCrownTier(tier)) return { ...tier }
+      const oldTilt = tier.angle * Math.PI / 180
+      const nextAngle = Math.max(5, Math.min(85, tier.angle + deltaDegrees))
+      const nextTilt = nextAngle * Math.PI / 180
+      const radialMeet = tier.distance / Math.max(1e-6, Math.sin(oldTilt))
+      return { ...tier, angle: nextAngle, distance: radialMeet * Math.sin(nextTilt) }
     }),
   }
 }
@@ -44,4 +59,28 @@ export function optimizePavilion(design, ior, options = {}) {
     returnImprovement: best.trace.returnPercent - baseline.trace.returnPercent,
     leakageReduction: baseline.trace.leakagePercent - best.trace.leakagePercent,
   }
+}
+
+export function optimizeCrown(design, ior, options = {}) {
+  const range = options.range ?? 4
+  const step = options.step ?? .5
+  const resolution = options.resolution ?? 11
+  if (!design.tiers.some(isCrownTier)) throw new Error('当前设计没有可优化的冠部刻面层')
+  const original = buildGemFromDesign(design)
+  const candidates = []
+  for (let delta = -range; delta <= range + 1e-8; delta += step) {
+    try {
+      const candidateDesign = shiftCrown(design, Number(delta.toFixed(4)))
+      const model = buildGemFromDesign(candidateDesign)
+      if (model.facets.length !== original.facets.length) continue
+      const trace = traceFaceUp(model, ior, resolution, 16)
+      candidates.push({ delta: Number(delta.toFixed(4)), design: candidateDesign, trace, score: opticalScore(trace) })
+    } catch { /* invalid candidate geometry is skipped */ }
+  }
+  if (!candidates.length) throw new Error('当前几何无法生成有效的冠角优化方案')
+  const baseline = candidates.find(candidate => Math.abs(candidate.delta) < 1e-8) || candidates[0]
+  const best = [...candidates].sort((a, b) => b.score - a.score || Math.abs(a.delta) - Math.abs(b.delta))[0]
+  return { baseline, best, tested: candidates.length,
+    returnImprovement: best.trace.returnPercent - baseline.trace.returnPercent,
+    leakageReduction: baseline.trace.leakagePercent - best.trace.leakagePercent }
 }
