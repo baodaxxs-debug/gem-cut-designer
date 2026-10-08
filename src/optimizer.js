@@ -1,5 +1,5 @@
 import { buildGemFromDesign } from './gemcad.js'
-import { traceFaceUp } from './raytrace.js'
+import { traceMultiAngle } from './raytrace.js'
 
 const isPavilionTier = tier => tier.angle < -1 && tier.angle > -89.9
 const isCrownTier = tier => tier.angle > 1 && tier.angle < 89.9
@@ -33,7 +33,7 @@ export function shiftCrown(design, deltaDegrees) {
 }
 
 function opticalScore(trace) {
-  return trace.returnPercent - trace.leakagePercent * 1.15 - trace.trappedPercent * .45
+  return trace.returnPercent - trace.leakagePercent * 1.15 - trace.trappedPercent * .45 + trace.averageReturnAlignment * 8
 }
 
 export function optimizePavilion(design, ior, options = {}) {
@@ -45,7 +45,7 @@ export function optimizePavilion(design, ior, options = {}) {
   for (let delta = -range; delta <= range + 1e-8; delta += step) {
     try {
       const candidateDesign = shiftPavilion(design, Number(delta.toFixed(4)))
-      const trace = traceFaceUp(buildGemFromDesign(candidateDesign), ior, resolution, 16)
+      const trace = traceMultiAngle(buildGemFromDesign(candidateDesign), ior, { resolution, maxBounces: 16 })
       candidates.push({ delta: Number(delta.toFixed(4)), design: candidateDesign, trace, score: opticalScore(trace) })
     } catch { /* invalid candidate geometry is skipped */ }
   }
@@ -73,7 +73,7 @@ export function optimizeCrown(design, ior, options = {}) {
       const candidateDesign = shiftCrown(design, Number(delta.toFixed(4)))
       const model = buildGemFromDesign(candidateDesign)
       if (model.facets.length !== original.facets.length) continue
-      const trace = traceFaceUp(model, ior, resolution, 16)
+      const trace = traceMultiAngle(model, ior, { resolution, maxBounces: 16 })
       candidates.push({ delta: Number(delta.toFixed(4)), design: candidateDesign, trace, score: opticalScore(trace) })
     } catch { /* invalid candidate geometry is skipped */ }
   }

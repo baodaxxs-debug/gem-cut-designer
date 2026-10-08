@@ -1,8 +1,8 @@
 import * as THREE from 'three'
 
 export const RENDER_PROFILES = {
-  mobile: { label: '手机端', bounces: 3, environmentSize: 128, dpr: [1, 1.25], dispersionScale: .65 },
-  desktop: { label: '电脑端', bounces: 6, environmentSize: 256, dpr: [1, 2], dispersionScale: 1 },
+  mobile: { label: '手机端', bounces: 3, spectralSamples: 3, environmentSize: 128, dpr: [1, 1.25], dispersionScale: .65 },
+  desktop: { label: '电脑端', bounces: 6, spectralSamples: 5, environmentSize: 256, dpr: [1, 2], dispersionScale: 1 },
 }
 
 export function resolveRenderDevice(choice = 'auto', capabilities) {

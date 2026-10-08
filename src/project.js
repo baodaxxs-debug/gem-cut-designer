@@ -8,7 +8,7 @@ export function serializeProject(workspace) {
   return JSON.stringify({
     format: PROJECT_FORMAT,
     version: PROJECT_VERSION,
-    appVersion: '6.5',
+    appVersion: '6.16',
     savedAt: new Date().toISOString(),
     workspace: clone(workspace),
   }, null, 2)

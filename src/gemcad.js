@@ -101,7 +101,9 @@ function supportForOutline(shape, azimuth, lengthToWidth) {
   const b = 1
   const x = Math.cos(azimuth)
   const z = Math.sin(azimuth)
+  if (shape === 'round') return 1
   if (shape === 'oval') return Math.hypot(a * x, b * z)
+  if (shape === 'square') return Math.abs(a * x) + Math.abs(b * z)
   if (shape === 'cushion') {
     const q = 4 / 3
     return (Math.abs(a * x) ** q + Math.abs(b * z) ** q) ** (1 / q)
@@ -138,13 +140,15 @@ function groupedTiers(records, prefix, startNumber) {
   }))
 }
 
-export function createOutlineStarter({ shape, title, lengthToWidth = 1.35, sides = 16, gear = 96 }) {
-  if (!['oval', 'marquise', 'cushion', 'emerald'].includes(shape)) throw new Error('不支持的基础外形')
+export function createOutlineStarter({ shape, title, family = shape, lengthToWidth = 1.35, sides = 16, gear = 96, tableScale = shape === 'emerald' ? .56 : .54, pavilionDepth = .92, crownHeight = .26, girdleHalf = .03 }) {
+  if (!['round', 'oval', 'marquise', 'cushion', 'emerald', 'square'].includes(shape)) throw new Error('不支持的基础外形')
   if (gear % sides !== 0) throw new Error('索引轮齿数必须能被腰围面数整除')
-  const girdleHalf = .03
-  const pavilionDepth = .92
-  const crownTop = .29
-  const tableScale = shape === 'emerald' ? .56 : .54
+  lengthToWidth = Math.max(1, Math.min(2.5, Number(lengthToWidth) || 1))
+  tableScale = Math.max(.25, Math.min(.82, Number(tableScale) || .54))
+  pavilionDepth = Math.max(.25, Math.min(1.6, Number(pavilionDepth) || .92))
+  crownHeight = Math.max(.08, Math.min(.65, Number(crownHeight) || .26))
+  girdleHalf = Math.max(.008, Math.min(.12, Number(girdleHalf) || .03))
+  const crownTop = girdleHalf + crownHeight
   const directions = Array.from({ length: sides }, (_, position) => {
     const rawIndex = position * gear / sides
     const index = rawIndex === 0 ? gear : rawIndex
@@ -168,17 +172,24 @@ export function createOutlineStarter({ shape, title, lengthToWidth = 1.35, sides
   const table = { id: `tier-${girdleTiers.length + pavilionTiers.length + crownTiers.length + 1}`, name: '台面', rawName: 'T', code: 'T', angle: 0, distance: crownTop, indexes: [gear], instructions: '切至冠部主面相接' }
   return {
     gear, gearDirection: 1, offset: 0, ior: 1.54, title,
-    symmetryFolds: shape === 'emerald' || shape === 'cushion' ? 4 : 2,
+    symmetryFolds: shape === 'round' || shape === 'square' || ((shape === 'emerald' || shape === 'cushion') && lengthToWidth === 1) ? 4 : 2,
     symmetryMirror: true,
     footnotes: ['Gem Cut Designer 参数化基础型；正式切磨前请按材料和毛坯优化角度与比例。'],
+    parametric: { shape, family, lengthToWidth, sides, tableScale, pavilionDepth, crownHeight, girdleHalf },
     tiers: [...girdleTiers, ...pavilionTiers, ...crownTiers, table],
   }
 }
 
+const STARTER_ROUND = createOutlineStarter({ shape: 'round', family: 'round-brilliant', title: '参数化圆形明亮式', lengthToWidth: 1, sides: 16, tableScale: .56, pavilionDepth: .86, crownHeight: .24 })
 const STARTER_OVAL = createOutlineStarter({ shape: 'oval', title: '参数化椭圆基础型 1:1.35', lengthToWidth: 1.35 })
 const STARTER_MARQUISE = createOutlineStarter({ shape: 'marquise', title: '参数化榄尖基础型 1:1.80', lengthToWidth: 1.8 })
 const STARTER_CUSHION = createOutlineStarter({ shape: 'cushion', title: '参数化垫形基础型 1:1.10', lengthToWidth: 1.1 })
+const STARTER_LONG_CUSHION = createOutlineStarter({ shape: 'cushion', family: 'long-cushion', title: '参数化长垫形 1:1.30', lengthToWidth: 1.3, tableScale: .58 })
 const STARTER_EMERALD = createOutlineStarter({ shape: 'emerald', title: '参数化祖母绿八角基础型 1:1.35', lengthToWidth: 1.35, sides: 8 })
+const STARTER_BAGUETTE = createOutlineStarter({ shape: 'emerald', family: 'baguette', title: '参数化长方阶梯型 1:1.70', lengthToWidth: 1.7, sides: 8, tableScale: .64, pavilionDepth: .65, crownHeight: .18 })
+const STARTER_RADIANT = createOutlineStarter({ shape: 'emerald', family: 'radiant', title: '参数化雷迪恩八角型 1:1.25', lengthToWidth: 1.25, sides: 8, tableScale: .61, pavilionDepth: .9, crownHeight: .22 })
+const STARTER_ASSCHER = createOutlineStarter({ shape: 'emerald', family: 'asscher', title: '参数化阿斯切方八角型', lengthToWidth: 1, sides: 8, tableScale: .58, pavilionDepth: .72, crownHeight: .2 })
+const STARTER_PRINCESS = createOutlineStarter({ shape: 'square', family: 'princess', title: '参数化公主方基础型', lengthToWidth: 1, sides: 4, tableScale: .62, pavilionDepth: .95, crownHeight: .2 })
 
 export const BUILTIN_DESIGNS = [
   { id: 'standard-round', name: '标准圆明亮式', shape: '圆形', asc: STANDARD_ROUND_BRILLIANT_ASC },
@@ -186,10 +197,16 @@ export const BUILTIN_DESIGNS = [
   { id: 'smallest-square', name: '最简方形（公版）', shape: '方形', asc: SMALLEST_SQUARE_ASC },
   { id: 'compear-125', name: 'Compear 1:1.25（MIT 示例）', shape: '梨形', asc: COMPEAR_125_ASC },
   { id: 'cube-illusion-triangle', name: 'Cube Illusion（MIT 示例）', shape: '三角形', asc: CUBE_ILLUSION_TRIANGLE_ASC },
+  { id: 'starter-round', name: '参数化明亮式', shape: '圆形', design: STARTER_ROUND },
   { id: 'starter-oval', name: '参数化基础型 1:1.35', shape: '椭圆形', design: STARTER_OVAL },
   { id: 'starter-marquise', name: '参数化基础型 1:1.80', shape: '榄尖形', design: STARTER_MARQUISE },
   { id: 'starter-cushion', name: '参数化基础型 1:1.10', shape: '垫形', design: STARTER_CUSHION },
+  { id: 'starter-long-cushion', name: '参数化长垫形 1:1.30', shape: '垫形', design: STARTER_LONG_CUSHION },
   { id: 'starter-emerald', name: '参数化八角基础型 1:1.35', shape: '祖母绿形', design: STARTER_EMERALD },
+  { id: 'starter-baguette', name: '参数化长方阶梯型 1:1.70', shape: '长方形', design: STARTER_BAGUETTE },
+  { id: 'starter-radiant', name: '参数化雷迪恩八角型 1:1.25', shape: '雷迪恩', design: STARTER_RADIANT },
+  { id: 'starter-asscher', name: '参数化阿斯切方八角型', shape: '阿斯切', design: STARTER_ASSCHER },
+  { id: 'starter-princess', name: '参数化公主方基础型', shape: '公主方', design: STARTER_PRINCESS },
 ]
 
 const TIER_NAMES = {
