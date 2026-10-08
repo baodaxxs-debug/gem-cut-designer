@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { buildClosedGemGeometry, resolveRenderDevice } from '../src/rendering.js'
+import { buildClosedGemGeometry, RENDER_PROFILES, resolveRenderDevice } from '../src/rendering.js'
 import { BUILTIN_DESIGNS, buildGemFromDesign, parseAsc } from '../src/gemcad.js'
 
 test('真实渲染网格把全部刻面合并为带颜色和朝外法线的封闭表面', () => {
@@ -38,6 +38,8 @@ test('GPU渲染档位支持自动检测和手动覆盖', () => {
   assert.equal(resolveRenderDevice('auto', { width: 1440, cores: 10, memory: 16, coarse: false }), 'desktop')
   assert.equal(resolveRenderDevice('desktop', { width: 390, cores: 2, memory: 2, coarse: true }), 'desktop')
   assert.equal(resolveRenderDevice('mobile', { width: 1440, cores: 10, memory: 16, coarse: false }), 'mobile')
+  assert.equal(RENDER_PROFILES.mobile.spectralSamples, 3)
+  assert.equal(RENDER_PROFILES.desktop.spectralSamples, 5)
 })
 
 test('真实体色浓度会中和饱和颜色，而教学刻面颜色保持明确', () => {

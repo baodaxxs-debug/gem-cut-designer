@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { BUILTIN_DESIGNS, COMPEAR_125_ASC, CUBE_ILLUSION_TRIANGLE_ASC, FIREWORKS_ROUND_ASC, STANDARD_ROUND_BRILLIANT_ASC, buildGemFromDesign, convertDesignGear, distanceThroughPoint, materializeDesign, measureGem, parseAsc, serializeAsc } from '../src/gemcad.js'
-import { traceFaceUp } from '../src/raytrace.js'
+import { traceFaceUp, traceMultiAngle, traceView } from '../src/raytrace.js'
 import { optimizeCrown, optimizePavilion, shiftCrown, shiftPavilion } from '../src/optimizer.js'
 import { serializeDxf, uniqueEdges } from '../src/diagram.js'
 import { packOpticalPlanes } from '../src/gpuOptics.js'
@@ -87,6 +87,19 @@ test('面朝上光线追踪返回有限结果', () => {
   assert.ok(result.leakagePercent >= 0 && result.leakagePercent <= 100)
 })
 
+test('多视角追踪综合正面和四个倾斜方向', () => {
+  const model = buildGemFromDesign(parseAsc(STANDARD_ROUND_BRILLIANT_ASC))
+  const tilted = traceView(model, 1.54, { resolution: 7, maxBounces: 12, tiltDegrees: 12, azimuthDegrees: 90 })
+  const result = traceMultiAngle(model, 1.54, { resolution: 7, maxBounces: 12 })
+  assert.ok(tilted.entered > 0)
+  assert.equal(result.viewCount, 5)
+  assert.equal(result.views[0].tiltDegrees, 0)
+  assert.ok(result.views.slice(1).every(view => view.tiltDegrees === 12))
+  assert.ok(result.returnPercent >= 0 && result.returnPercent <= 100)
+  assert.ok(result.leakagePercent >= 0 && result.leakagePercent <= 100)
+  assert.ok(result.averageReturnAlignment >= 0 && result.averageReturnAlignment <= 1)
+})
+
 test('GPU光学预览把最终有效刻面打包为半空间平面', () => {
   const model = buildGemFromDesign(parseAsc(STANDARD_ROUND_BRILLIANT_ASC))
   const result = packOpticalPlanes(model)
@@ -115,15 +128,16 @@ test('负齿轮方向的三角形 ASC 可导入、建模和往返', () => {
   assert.equal(parseAsc(serializeAsc(design)).gearDirection, -1)
 })
 
-test('四种参数化常见外形均可封闭建模并导出 ASC', () => {
+test('十种参数化常见外形均可封闭建模并导出 ASC', () => {
   const starters = BUILTIN_DESIGNS.filter(item => item.id.startsWith('starter-'))
-  assert.equal(starters.length, 4)
+  assert.equal(starters.length, 10)
   starters.forEach(item => {
     const model = buildGemFromDesign(item.design)
     const metrics = measureGem(model)
-    assert.ok(model.facets.length >= 25, item.id)
+    assert.ok(model.facets.length >= 13, item.id)
     assert.equal(model.facets.length, item.design.tiers.reduce((sum, tier) => sum + tier.indexes.length, 0), item.id)
-    assert.ok(metrics.lengthToWidth > 1.05, item.id)
+    if (item.design.parametric.shape === 'round' || item.design.parametric.shape === 'square' || item.id === 'starter-asscher') assert.ok(metrics.lengthToWidth >= .99 && metrics.lengthToWidth <= 1.01, item.id)
+    else assert.ok(metrics.lengthToWidth > 1.05, item.id)
     const restored = parseAsc(serializeAsc(item.design))
     assert.equal(buildGemFromDesign(restored).facets.length, model.facets.length, item.id)
   })
