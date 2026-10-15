@@ -13,10 +13,12 @@ precision highp sampler2D;
 in vec2 uv;
 out vec4 outColor;
 uniform vec2 resolution;
-uniform vec3 cameraPosition,cameraForward,cameraRight,cameraUp,opticAxis,modelCenter,modelExtent,zoneColorA,zoneColorB;
-uniform sampler2D triangleData;
-uniform int triangleCount,maxBounces,environmentPreset,spectralSamples,zoneMode;
-uniform float ior,dispersion,birefringence,absorption,exposure,appearanceStrength,environmentRotation,environmentIntensity,zoneBoundary,zoneRotation;
+uniform vec3 cameraPosition,cameraForward,cameraRight,cameraUp,opticAxis,modelCenter,modelExtent,zoneColorA,zoneColorB,backgroundColor,absorptionShort;
+uniform vec2 absorptionLong;
+uniform sampler2D triangleData,accumulationTexture;
+uniform int triangleCount,maxBounces,environmentPreset,spectralSamples,zoneMode,linearAccumulation;
+uniform float ior,dispersion,birefringence,absorption,exposure,appearanceStrength,environmentRotation,environmentIntensity,zoneBoundary,zoneRotation,sampleIndex;
+uniform vec2 pixelJitter;
 uniform vec3 bodyColor;
 const float EPS=.0015;
 const int MAX_TRIANGLES=${MAX_TRIANGLES};
@@ -27,10 +29,10 @@ vec3 environmentLight(vec3 rawDirection){
   float cosine=cos(environmentRotation),sine=sin(environmentRotation);
   vec3 d=normalize(vec3(cosine*rawDirection.x+sine*rawDirection.z,rawDirection.y,-sine*rawDirection.x+cosine*rawDirection.z));
   float horizon=smoothstep(-.7,.9,d.y);
-  vec3 low=vec3(.025,.035,.055),high=vec3(.82,.88,.94),warmColor=vec3(2.7,1.5,.55);
-  if(environmentPreset==1){low=vec3(.055,.075,.11);high=vec3(.94,.98,1.);warmColor=vec3(1.3,1.9,2.8);}
-  else if(environmentPreset==2){low=vec3(.055,.025,.018);high=vec3(1.,.72,.42);warmColor=vec3(4.2,1.5,.38);}
-  else if(environmentPreset==3){low=vec3(.004,.006,.012);high=vec3(.62,.68,.8);warmColor=vec3(2.2,.85,.25);}
+  vec3 low=vec3(.025),high=vec3(.84),warmColor=vec3(2.4);
+  if(environmentPreset==1){low=vec3(.18);high=vec3(.98,1.,1.);warmColor=vec3(2.5,2.55,2.6);}
+  else if(environmentPreset==2){low=vec3(.32);high=vec3(1.);warmColor=vec3(3.2);}
+  else if(environmentPreset==3){low=vec3(.003);high=vec3(.22);warmColor=vec3(1.7);}
   vec3 base=mix(low,high,horizon);
   float left=pow(max(0.,dot(d,normalize(vec3(-.72,.48,.5)))),48.);
   float right=pow(max(0.,dot(d,normalize(vec3(.78,.32,.54)))),68.);
@@ -86,6 +88,36 @@ float extraordinaryIor(float ordinaryIor,vec3 direction){
   return ordinaryIor*extraordinary/sqrt(max(1e-6,extraordinary*extraordinary*cosine2+ordinaryIor*ordinaryIor*sine2));
 }
 
+float cauchyIor(float dLineIor,float fMinusCDispersion,float wavelengthNm){
+  const float fLine=486.13,dLine=589.29,cLine=656.27;
+  float inverseF=1./(fLine*fLine),inverseC=1./(cLine*cLine);
+  float coefficientB=max(0.,fMinusCDispersion)/max(1e-9,inverseF-inverseC);
+  float coefficientA=dLineIor-coefficientB/(dLine*dLine);
+  return max(1.001,coefficientA+coefficientB/(wavelengthNm*wavelengthNm));
+}
+
+// Five-sample real-time approximation of CIE 1931 2 degree XYZ under D65.
+// Values are sampled from the official CIE 1 nm data sets and normalized to Y=1.
+vec3 cieD65ToLinearSrgb(vec3 blue460,vec3 cyan500,vec3 green550,vec3 amber600,vec3 red650){
+  float l460=dot(max(blue460,vec3(0.)),vec3(.02,.08,.90));
+  float l500=dot(max(cyan500,vec3(0.)),vec3(.03,.52,.45));
+  float l550=dot(max(green550,vec3(0.)),vec3(.04,.92,.04));
+  float l600=dot(max(amber600,vec3(0.)),vec3(.57,.42,.01));
+  float l650=dot(max(red650,vec3(0.)),vec3(.92,.08,0.));
+  vec3 xyz=(
+    l460*1.17812*vec3(.2908,.0600,1.6692)+
+    l500*1.09354*vec3(.0049,.3230,.2720)+
+    l550*1.04046*vec3(.43345,.99495,.00875)+
+    l600*.900062*vec3(1.0622,.6310,.0008)+
+    l650*.800268*vec3(.2835,.1070,0.)
+  )/2.1125;
+  return max(vec3(
+    3.2406*xyz.x-1.5372*xyz.y-.4986*xyz.z,
+    -.9689*xyz.x+1.8758*xyz.y+.0415*xyz.z,
+    .0557*xyz.x-.2040*xyz.y+1.0570*xyz.z
+  ),vec3(0.));
+}
+
 float fresnel(float cosineIncident,float n1,float n2){
   float ci=clamp(abs(cosineIncident),0.,1.);float ratio=n1/n2;
   float st2=ratio*ratio*max(0.,1.-ci*ci);if(st2>=1.)return 1.;
@@ -112,11 +144,22 @@ vec3 zonedBodyColor(vec3 position){
   return mix(zoneColorA,zoneColorB,smoothstep(divider-.5,divider+.5,rotated.x));
 }
 
-vec3 absorptionAt(vec3 position){
-  return vec3(absorption)-log(max(zonedBodyColor(position),vec3(.02)))*.9;
+float colorAbsorptionAt(vec3 color,float wavelengthNm){
+  float transmission;
+  if(wavelengthNm<=480.)transmission=color.b;
+  else if(wavelengthNm<=525.)transmission=mix(color.b,color.g,(wavelengthNm-480.)/45.);
+  else if(wavelengthNm<=575.)transmission=color.g;
+  else if(wavelengthNm<=625.)transmission=mix(color.g,color.r,(wavelengthNm-575.)/50.);
+  else transmission=color.r;
+  return -log(max(.035,.10+transmission*.90))*.15;
 }
 
-vec3 traceGem(vec3 origin,vec3 direction,float baseIor,float extraordinaryRay,float channelSeed){
+float absorptionAt(vec3 position,float wavelengthNm,float materialAbsorption){
+  if(zoneMode==0)return absorption+materialAbsorption;
+  return absorption+colorAbsorptionAt(zonedBodyColor(position),wavelengthNm);
+}
+
+vec3 traceGem(vec3 origin,vec3 direction,float baseIor,float extraordinaryRay,float channelSeed,float wavelengthNm,float channelAbsorption){
   float entryT,entryRoughness;vec3 entryNormal,entryColor;
   if(!nearestHit(origin,direction,entryT,entryNormal,entryColor,entryRoughness))return vec3(-1.);
   if(dot(direction,entryNormal)>0.)entryNormal=-entryNormal;
@@ -134,7 +177,7 @@ vec3 traceGem(vec3 origin,vec3 direction,float baseIor,float extraordinaryRay,fl
     float boundaryT,boundaryRoughness;vec3 boundaryNormal,boundaryColor;
     if(!nearestHit(insideOrigin,insideDirection,boundaryT,boundaryNormal,boundaryColor,boundaryRoughness))break;
     vec3 boundary=insideOrigin+insideDirection*boundaryT;
-    throughput*=exp(-absorptionAt((insideOrigin+boundary)*.5)*boundaryT);
+    throughput*=exp(-absorptionAt((insideOrigin+boundary)*.5,wavelengthNm,channelAbsorption)*boundaryT);
     if(dot(insideDirection,boundaryNormal)<0.)boundaryNormal=-boundaryNormal;
     boundaryNormal=roughNormal(boundaryNormal,boundaryRoughness,gl_FragCoord.x*1.37+gl_FragCoord.y+float(bounce)*37.1+channelSeed);
     float localIor=mix(baseIor,extraordinaryIor(baseIor,insideDirection),extraordinaryRay);
@@ -149,30 +192,62 @@ vec3 traceGem(vec3 origin,vec3 direction,float baseIor,float extraordinaryRay,fl
   return radiance;
 }
 
-vec3 tracePolarized(vec3 origin,vec3 direction,float materialIor,float channelSeed){
-  if(birefringence<.0001)return traceGem(origin,direction,materialIor,0.,channelSeed);
-  if(spectralSamples<5)return traceGem(origin,direction,materialIor,.35,channelSeed+31.);
-  vec3 ordinary=traceGem(origin,direction,materialIor,0.,channelSeed);
-  vec3 extraordinary=traceGem(origin,direction,materialIor,1.,channelSeed+61.);
+vec3 tracePolarized(vec3 origin,vec3 direction,float materialIor,float channelSeed,float wavelengthNm,float channelAbsorption){
+  if(birefringence<.0001)return traceGem(origin,direction,materialIor,0.,channelSeed,wavelengthNm,channelAbsorption);
+  if(spectralSamples<5)return traceGem(origin,direction,materialIor,.35,channelSeed+31.,wavelengthNm,channelAbsorption);
+  vec3 ordinary=traceGem(origin,direction,materialIor,0.,channelSeed,wavelengthNm,channelAbsorption);
+  vec3 extraordinary=traceGem(origin,direction,materialIor,1.,channelSeed+61.,wavelengthNm,channelAbsorption);
   return mix(ordinary,extraordinary,.5);
 }
 
+vec3 toneMapDisplay(vec3 color){
+  color=clamp((color*(2.51*color+.03))/(color*(2.43*color+.59)+.14),0.,1.);
+  return pow(color,vec3(1./2.2));
+}
+
+vec3 accumulateSample(vec3 color){
+  vec3 prepared=linearAccumulation==1?color:toneMapDisplay(color);
+  if(sampleIndex>.5){
+    vec3 previous=texelFetch(accumulationTexture,ivec2(gl_FragCoord.xy),0).rgb;
+    prepared=mix(previous,prepared,1./(sampleIndex+1.));
+  }
+  return prepared;
+}
+
 void main(){
-  vec2 screen=(gl_FragCoord.xy/resolution-.5)*2.;screen.x*=resolution.x/max(1.,resolution.y);
+  vec2 screen=((gl_FragCoord.xy+pixelJitter)/resolution-.5)*2.;screen.x*=resolution.x/max(1.,resolution.y);
   vec3 direction=normalize(cameraForward+cameraRight*screen.x*.16+cameraUp*screen.y*.16);
-  float redIor=max(1.001,ior-dispersion*.48),blueIor=ior+dispersion*.52;
-  vec3 red=tracePolarized(cameraPosition,direction,redIor,3.1);
-  if(red.r<0.){vec3 bg=environmentLight(direction)*.16;outColor=vec4(pow(bg,vec3(1./2.2)),1.);return;}
-  vec3 green=tracePolarized(cameraPosition,direction,ior,17.9),blue=tracePolarized(cameraPosition,direction,blueIor,41.3);
+  float redIor=cauchyIor(ior,dispersion,650.),blueIor=cauchyIor(ior,dispersion,460.);
+  vec3 red=tracePolarized(cameraPosition,direction,redIor,3.1,650.,absorptionLong.y);
+  if(red.r<0.){
+    float vignette=1.-smoothstep(.35,1.45,length(screen))*.08;
+    outColor=vec4(accumulateSample(pow(backgroundColor,vec3(2.2))*vignette),1.);return;
+  }
+  vec3 green=tracePolarized(cameraPosition,direction,cauchyIor(ior,dispersion,550.),17.9,550.,absorptionShort.z),blue=tracePolarized(cameraPosition,direction,blueIor,41.3,460.,absorptionShort.x);
   vec3 color;
   if(spectralSamples>=5){
-    vec3 amber=tracePolarized(cameraPosition,direction,max(1.001,ior-dispersion*.24),9.7);
-    vec3 cyan=tracePolarized(cameraPosition,direction,ior+dispersion*.26,29.5);
-    color=(red*vec3(1.,0.,0.)+amber*vec3(1.,.45,0.)+green*vec3(.15,1.,.04)+cyan*vec3(0.,.42,1.)+blue*vec3(.26,0.,1.))/vec3(2.41,1.87,2.04);
+    vec3 amber=tracePolarized(cameraPosition,direction,cauchyIor(ior,dispersion,600.),9.7,600.,absorptionLong.x);
+    vec3 cyan=tracePolarized(cameraPosition,direction,cauchyIor(ior,dispersion,500.),29.5,500.,absorptionShort.y);
+    color=cieD65ToLinearSrgb(blue,cyan,green,amber,red);
   }else color=vec3(red.r,green.g,blue.b);
   color*=exp2(exposure);
-  color=clamp((color*(2.51*color+.03))/(color*(2.43*color+.59)+.14),0.,1.);
-  outColor=vec4(pow(color,vec3(1./2.2)),1.);
+  outColor=vec4(accumulateSample(color),1.);
+}`
+
+const DISPLAY_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+in vec2 uv;
+out vec4 outColor;
+uniform sampler2D image;
+uniform int linearInput;
+void main(){
+  vec3 color=texture(image,uv).rgb;
+  if(linearInput==1){
+    color=clamp((color*(2.51*color+.03))/(color*(2.43*color+.59)+.14),0.,1.);
+    color=pow(color,vec3(1./2.2));
+  }
+  outColor=vec4(color,1.);
 }`
 
 const normalize = vector => {
@@ -238,9 +313,9 @@ function shader(gl, type, source) {
   return result
 }
 
-function program(gl) {
+function program(gl, fragmentSource = FRAGMENT_SHADER) {
   const result = gl.createProgram()
-  const vertex = shader(gl, gl.VERTEX_SHADER, VERTEX_SHADER), fragment = shader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER)
+  const vertex = shader(gl, gl.VERTEX_SHADER, VERTEX_SHADER), fragment = shader(gl, gl.FRAGMENT_SHADER, fragmentSource)
   gl.attachShader(result, vertex); gl.attachShader(result, fragment); gl.bindAttribLocation(result, 0, 'position'); gl.linkProgram(result)
   gl.deleteShader(vertex); gl.deleteShader(fragment)
   if (!gl.getProgramParameter(result, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(result))
@@ -251,23 +326,45 @@ export function createGpuOpticsRenderer(canvas) {
   const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' })
   if (!gl) throw new Error('此设备不支持 WebGL2 光学预览')
   const pipeline = program(gl)
+  const displayPipeline = program(gl, DISPLAY_FRAGMENT_SHADER)
   const buffer = gl.createBuffer()
   const triangleTexture = gl.createTexture()
+  const accumulationTextures = [gl.createTexture(), gl.createTexture()]
+  const accumulationFramebuffers = [gl.createFramebuffer(), gl.createFramebuffer()]
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,3,-1,-1,3]), gl.STATIC_DRAW)
   gl.useProgram(pipeline); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, triangleTexture)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
   const location = name => gl.getUniformLocation(pipeline, name)
-  const uniforms = Object.fromEntries(['resolution','cameraPosition','cameraForward','cameraRight','cameraUp','opticAxis','modelCenter','modelExtent','zoneColorA','zoneColorB','triangleData','triangleCount','maxBounces','ior','dispersion','birefringence','spectralSamples','zoneMode','absorption','exposure','appearanceStrength','environmentRotation','environmentIntensity','environmentPreset','zoneBoundary','zoneRotation','bodyColor'].map(name => [name, location(name)]))
-  let last
-  const resize = () => {
-    const ratio = Math.min(2, window.devicePixelRatio || 1), width = Math.max(1, Math.round(canvas.clientWidth * ratio)), height = Math.max(1, Math.round(canvas.clientHeight * ratio))
-    if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height }
+  const uniforms = Object.fromEntries(['resolution','cameraPosition','cameraForward','cameraRight','cameraUp','opticAxis','modelCenter','modelExtent','zoneColorA','zoneColorB','backgroundColor','absorptionShort','absorptionLong','triangleData','accumulationTexture','triangleCount','maxBounces','ior','dispersion','birefringence','spectralSamples','zoneMode','absorption','exposure','appearanceStrength','environmentRotation','environmentIntensity','environmentPreset','zoneBoundary','zoneRotation','bodyColor','sampleIndex','pixelJitter','linearAccumulation'].map(name => [name, location(name)]))
+  const displayUniforms = { image: gl.getUniformLocation(displayPipeline, 'image'), linearInput: gl.getUniformLocation(displayPipeline, 'linearInput') }
+  const floatAccumulation = Boolean(gl.getExtension('EXT_color_buffer_float'))
+  let last, animationFrame = 0, generation = 0, accumulationWidth = 0, accumulationHeight = 0
+  const configureAccumulation = () => {
+    if (accumulationWidth === canvas.width && accumulationHeight === canvas.height) return
+    accumulationWidth = canvas.width; accumulationHeight = canvas.height
+    accumulationTextures.forEach((texture, index) => {
+      gl.bindTexture(gl.TEXTURE_2D, texture)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
+      gl.texImage2D(gl.TEXTURE_2D, 0, floatAccumulation ? gl.RGBA16F : gl.RGBA8, canvas.width, canvas.height, 0, gl.RGBA, floatAccumulation ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accumulationFramebuffers[index])
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0)
+      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('无法创建渐进渲染缓冲区')
+    })
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null)
   }
-  const observer = new ResizeObserver(() => { resize(); if (last) draw(last) }); observer.observe(canvas)
+  const resize = options => {
+    const ratio = Math.min(Math.max(1, Number(options?.pixelRatioMax) || 2), window.devicePixelRatio || 1), width = Math.max(1, Math.round(canvas.clientWidth * ratio)), height = Math.max(1, Math.round(canvas.clientHeight * ratio))
+    if (canvas.width !== width || canvas.height !== height) { canvas.width = width; canvas.height = height; configureAccumulation(); return true }
+    configureAccumulation(); return false
+  }
+  const observer = new ResizeObserver(() => { if (last) draw(last) }); observer.observe(canvas)
   function draw(options) {
-    last = options; resize()
+    last = options; generation += 1
+    if (animationFrame) cancelAnimationFrame(animationFrame)
+    resize(options)
     const { packed, count, width, height } = packOpticalTriangles(options.model, options)
     const camera = options.cameraOrbit || {}, yaw = Number.isFinite(camera.yaw) ? camera.yaw : .68, pitch = Number.isFinite(camera.pitch) ? camera.pitch : .62, distance = Number.isFinite(camera.distance) ? camera.distance : 8.6
     const cameraPosition = [Math.sin(yaw) * Math.cos(pitch) * distance, Math.sin(pitch) * distance, Math.cos(yaw) * Math.cos(pitch) * distance], forward = normalize(cameraPosition.map(value => -value))
@@ -276,6 +373,8 @@ export function createGpuOpticsRenderer(canvas) {
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, triangleTexture)
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, packed)
     gl.uniform1i(uniforms.triangleData, 0); gl.uniform1i(uniforms.triangleCount, count)
+    gl.uniform1i(uniforms.accumulationTexture, 1)
+    gl.uniform1i(uniforms.linearAccumulation, floatAccumulation ? 1 : 0)
     gl.uniform2f(uniforms.resolution, canvas.width, canvas.height)
     gl.uniform3fv(uniforms.cameraPosition, cameraPosition); gl.uniform3fv(uniforms.cameraForward, forward); gl.uniform3fv(uniforms.cameraRight, right); gl.uniform3fv(uniforms.cameraUp, up)
     const azimuth = (Number(options.opticAxisAzimuth) || 0) * Math.PI / 180, tilt = Math.max(0, Math.min(90, Number(options.opticAxisTilt) || 0)) * Math.PI / 180
@@ -285,18 +384,47 @@ export function createGpuOpticsRenderer(canvas) {
     gl.uniform3fv(uniforms.modelCenter, minimum.map((value, axis) => (value + maximum[axis]) / 2))
     gl.uniform3fv(uniforms.modelExtent, minimum.map((value, axis) => Math.max(.0001, (maximum[axis] - value) / 2)))
     gl.uniform1i(uniforms.maxBounces, Math.max(1, Math.min(8, options.bounces || 6)))
-    gl.uniform1f(uniforms.ior, options.ior); gl.uniform1f(uniforms.dispersion, options.dispersion); gl.uniform1f(uniforms.birefringence, Math.max(0, Math.min(.2, Number(options.birefringence) || 0))); gl.uniform1i(uniforms.spectralSamples, options.spectralSamples >= 5 ? 5 : 3); gl.uniform1f(uniforms.absorption, Math.max(0, options.bodyColorStrength - .1) * .18); gl.uniform1f(uniforms.exposure, .2)
+    const spectralAbsorption = Array.isArray(options.spectralAbsorption) && options.spectralAbsorption.length >= 5 ? options.spectralAbsorption : [0, 0, 0, 0, 0]
+    gl.uniform1f(uniforms.ior, options.ior); gl.uniform1f(uniforms.dispersion, options.dispersion); gl.uniform1f(uniforms.birefringence, Math.max(0, Math.min(.2, Number(options.birefringence) || 0))); gl.uniform1i(uniforms.spectralSamples, options.spectralSamples >= 5 ? 5 : 3); gl.uniform1f(uniforms.absorption, .002); gl.uniform3fv(uniforms.absorptionShort, spectralAbsorption.slice(0, 3)); gl.uniform2fv(uniforms.absorptionLong, spectralAbsorption.slice(3, 5)); gl.uniform1f(uniforms.exposure, .2)
     gl.uniform1f(uniforms.appearanceStrength, options.showAppearance ? 1 : 0)
     gl.uniform1f(uniforms.environmentRotation, (Number(options.environmentRotation) || 0) * Math.PI / 180)
     gl.uniform1f(uniforms.environmentIntensity, Math.max(.2, Math.min(2.5, Number(options.environmentIntensity) || 1)))
     gl.uniform1i(uniforms.environmentPreset, Math.max(0, Math.min(3, Number(options.environmentPreset) || 0)))
+    gl.uniform3fv(uniforms.backgroundColor, rgb(options.backgroundColor || '#17191c'))
     const zoneModes = { uniform: 0, watermelon: 1, bicolor: 2, gradient: 3 }
     gl.uniform1i(uniforms.zoneMode, zoneModes[options.colorZoneMode] || 0)
     gl.uniform3fv(uniforms.zoneColorA, rgb(options.zoneColorA || options.gemColor)); gl.uniform3fv(uniforms.zoneColorB, rgb(options.zoneColorB || options.gemColor))
     gl.uniform1f(uniforms.zoneBoundary, Math.max(.15, Math.min(.85, Number(options.zoneBoundary) || .58)))
     gl.uniform1f(uniforms.zoneRotation, (Number(options.zoneRotation) || 0) * Math.PI / 180)
-    gl.uniform3fv(uniforms.bodyColor, rgb(options.gemColor)); gl.drawArrays(gl.TRIANGLES, 0, 3)
-    canvas.dataset.renderer = 'webgl2-triangle-raytrace'
+    gl.uniform3fv(uniforms.bodyColor, rgb(options.gemColor))
+    const targetSamples = Math.max(1, Math.min(128, Number(options.progressiveSamples) || 1))
+    const currentGeneration = generation
+    let sample = 0, readIndex = 0
+    const halton = (index, base) => { let fraction = 1, result = 0, value = index; while (value > 0) { fraction /= base; result += fraction * (value % base); value = Math.floor(value / base) } return result }
+    const renderSample = () => {
+      if (currentGeneration !== generation) return
+      const writeIndex = 1 - readIndex
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accumulationFramebuffers[writeIndex])
+      gl.viewport(0, 0, canvas.width, canvas.height)
+      gl.useProgram(pipeline)
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, triangleTexture)
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, accumulationTextures[readIndex])
+      gl.uniform1f(uniforms.sampleIndex, sample)
+      gl.uniform2f(uniforms.pixelJitter, halton(sample + 1, 2) - .5, halton(sample + 1, 3) - .5)
+      gl.drawArrays(gl.TRIANGLES, 0, 3)
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null)
+      gl.useProgram(displayPipeline)
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, accumulationTextures[writeIndex])
+      gl.uniform1i(displayUniforms.image, 0); gl.uniform1i(displayUniforms.linearInput, floatAccumulation ? 1 : 0)
+      gl.drawArrays(gl.TRIANGLES, 0, 3)
+      readIndex = writeIndex; sample += 1
+      canvas.dataset.renderer = 'webgl2-progressive-raytrace'; canvas.dataset.samples = String(sample); canvas.dataset.accumulation = floatAccumulation ? 'linear-hdr16f' : 'display-rgba8'
+      options.onProgress?.(sample, targetSamples, floatAccumulation ? 'HDR16F' : '兼容模式')
+      if (sample < targetSamples) animationFrame = requestAnimationFrame(renderSample)
+      else animationFrame = 0
+    }
+    renderSample()
   }
-  return { draw, destroy() { observer.disconnect(); gl.deleteTexture(triangleTexture); gl.deleteBuffer(buffer); gl.deleteProgram(pipeline); last = null } }
+  const cancel = () => { generation += 1; if (animationFrame) cancelAnimationFrame(animationFrame); animationFrame = 0; last = null }
+  return { draw, cancel, destroy() { cancel(); observer.disconnect(); gl.deleteTexture(triangleTexture); accumulationTextures.forEach(texture => gl.deleteTexture(texture)); accumulationFramebuffers.forEach(framebuffer => gl.deleteFramebuffer(framebuffer)); gl.deleteBuffer(buffer); gl.deleteProgram(pipeline); gl.deleteProgram(displayPipeline) } }
 }

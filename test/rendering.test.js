@@ -40,6 +40,10 @@ test('GPU渲染档位支持自动检测和手动覆盖', () => {
   assert.equal(resolveRenderDevice('mobile', { width: 1440, cores: 10, memory: 16, coarse: false }), 'mobile')
   assert.equal(RENDER_PROFILES.mobile.spectralSamples, 3)
   assert.equal(RENDER_PROFILES.desktop.spectralSamples, 5)
+  assert.equal(RENDER_PROFILES.mobile.progressiveSamples, 1)
+  assert.equal(RENDER_PROFILES.desktop.progressiveSamples, 64)
+  assert.equal(RENDER_PROFILES.desktop.bounces, 8)
+  assert.equal(RENDER_PROFILES.desktop.linearHdr, true)
 })
 
 test('真实体色浓度会中和饱和颜色，而教学刻面颜色保持明确', () => {

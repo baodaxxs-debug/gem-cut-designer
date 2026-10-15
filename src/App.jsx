@@ -2,9 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { Html, MeshRefractionMaterial, OrbitControls } from '@react-three/drei'
 import * as THREE from 'three'
-import { MATERIALS, MATERIAL_GROUPS, criticalAngle, leakageAssessment } from './optics.js'
+import { MATERIALS, MATERIAL_GROUPS, OPTICAL_CLASSES, criticalAngle, leakageAssessment } from './optics.js'
 import { BUILTIN_DESIGNS, buildGemFromDesign, convertDesignGear, createOutlineStarter, distanceThroughPoint, materializeDesign, measureGem, parseAsc, parseGem, serializeAsc } from './gemcad.js'
-import { traceFaceUp, traceMultiAngle } from './raytrace.js'
+import { evaluateOpticalPerformance, traceDiagnosticRay, traceFaceUp } from './raytrace.js'
 import { optimizeCrown, optimizePavilion } from './optimizer.js'
 import { serializeDxf } from './diagram.js'
 import { evaluateRoughFit } from './rough.js'
@@ -20,7 +20,7 @@ import { addEdgeBevels, removeEdgeBevelGroup } from './edgeCut.js'
 import { addPathGroove, addVGrooves, removeVGrooveGroup } from './vGroove.js'
 import { parseProject, serializeProject } from './project.js'
 import { FACET_PALETTES, GEM_COLOR_PRESETS, createTierPalette, tuneGemColor } from './colorDesign.js'
-import { calculateGestureCut } from './gestureCut.js'
+import { createMaterialAbsorptionSpectrum, materialAbsorptionSamples } from './materialSpectra.js'
 import './App.css'
 
 const clone = value => JSON.parse(JSON.stringify(value))
@@ -39,10 +39,16 @@ const CUT_TOOLS = {
   polish: { name: '抛光盘', sensitivity: .18 },
 }
 const OPTICAL_ENVIRONMENTS = {
-  studio: { name: '中性珠宝摄影棚', preset: 0 },
-  daylight: { name: '冷白日光', preset: 1 },
-  warm: { name: '暖色展示柜', preset: 2 },
-  contrast: { name: '高对比暗场', preset: 3 },
+  studio: { name: '中性黑白摄影棚', preset: 0 },
+  daylight: { name: 'CIE D65 标准日光（评价）', preset: 1 },
+  highkey: { name: '中性高调柔光', preset: 2 },
+  darkfield: { name: '中性暗场轮廓光', preset: 3 },
+}
+const VIEW_BACKGROUNDS = {
+  black: { name: '纯黑', color: '#050607' },
+  charcoal: { name: '炭灰', color: '#17191c' },
+  gray: { name: '中性灰', color: '#707070' },
+  light: { name: '浅灰', color: '#d8d8d6' },
 }
 const COLOR_ZONE_MODES = {
   uniform: '均匀体色',
@@ -72,6 +78,57 @@ const inferShape = design => {
     [/trillion|trilliant|triangle|三角/, '三角形'], [/octagon|八角/, '八角形'], [/round|圆形/, '圆形'],
   ]
   return rules.find(([pattern]) => pattern.test(title))?.[1] || '未分类'
+}
+
+function buildGeometryResult(design, facetEdits, id) {
+  try { return { id, model: buildGemFromDesign(design, facetEdits), error: '' } }
+  catch (error) { return { id, model: null, error: error.message } }
+}
+
+function useGemGeometry(design, facetEdits) {
+  const sequence = useRef(0)
+  const workerRef = useRef(null)
+  const busy = useRef(false)
+  const pending = useRef(null)
+  const [result, setResult] = useState(() => buildGeometryResult(design, facetEdits, 0))
+
+  useEffect(() => {
+    if (typeof window.Worker !== 'function') return undefined
+    let worker
+    try { worker = new Worker(new URL('./geometryWorker.js', import.meta.url), { type: 'module' }) }
+    catch { return undefined }
+    workerRef.current = worker
+    const send = job => { busy.current = true; worker.postMessage(job) }
+    worker.onmessage = event => {
+      busy.current = false
+      const next = pending.current
+      pending.current = null
+      if (!next && event.data.id === sequence.current) setResult(event.data)
+      if (next) send(next)
+    }
+    worker.onerror = () => {
+      workerRef.current = null
+      busy.current = false
+      const next = pending.current
+      pending.current = null
+      if (next) window.setTimeout(() => setResult(buildGeometryResult(next.design, next.facetEdits, next.id)), 0)
+    }
+    return () => { worker.terminate(); workerRef.current = null; busy.current = false; pending.current = null }
+  }, [])
+
+  useEffect(() => {
+    const id = ++sequence.current
+    const job = { id, design, facetEdits }
+    if (workerRef.current) {
+      if (busy.current) pending.current = job
+      else { busy.current = true; workerRef.current.postMessage(job) }
+      return undefined
+    }
+    const timer = window.setTimeout(() => setResult(buildGeometryResult(design, facetEdits, id)), 0)
+    return () => window.clearTimeout(timer)
+  }, [design, facetEdits])
+
+  return { ...result, pending: result.id !== sequence.current }
 }
 
 function materializeAppearance(design, edits, tierColors, facetColors, tierFinishes = {}, facetFinishes = {}) {
@@ -185,6 +242,18 @@ function OpticAxisGuide({ model, azimuth = 0, tilt = 0 }) {
   </group>
 }
 
+function RayPathGuide({ segments = [] }) {
+  const paths = useMemo(() => segments.filter(segment => segment.energy > 1e-4).map((segment, index) => {
+    const start = new THREE.Vector3(...segment.from), end = new THREE.Vector3(...segment.to)
+    const direction = end.clone().sub(start), length = direction.length()
+    const midpoint = start.clone().add(end).multiplyScalar(.5)
+    const quaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize())
+    return { ...segment, index, length, midpoint, quaternion }
+  }), [segments])
+  const colors = { incident: '#66e5ff', surface: '#ffffff', internal: '#ffd45c', returned: '#55f59a', leaked: '#ff5577' }
+  return <group renderOrder={40}>{paths.map(path => <mesh key={`${path.index}-${path.type}`} position={path.midpoint} quaternion={path.quaternion}><cylinderGeometry args={[path.type === 'internal' ? .018 : .024, path.type === 'internal' ? .018 : .024, path.length, 8]}/><meshBasicMaterial color={colors[path.type] || '#ffffff'} transparent opacity={Math.max(.38, Math.min(1, .38 + path.energy * .78))} depthTest={false}/></mesh>)}</group>
+}
+
 function FacetEdgePicker({ facet, selectedEdge, onSelect }) {
   const [hovered, setHovered] = useState(-1)
   if (!facet?.points?.length || !onSelect) return null
@@ -243,11 +312,15 @@ function RealisticGem({ model, ior, dispersion, gemColor, bodyColorStrength, ren
   </mesh>
 }
 
-function GpuOpticalPreview({ model, ior, dispersion, birefringence = 0, opticAxisAzimuth = 0, opticAxisTilt = 0, gemColor, bodyColorStrength, colorZoneMode = 'uniform', zoneColorA = '#d84270', zoneColorB = '#23845f', zoneBoundary = .58, zoneRotation = 0, renderProfile, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environment = 'studio', environmentRotation = 0, environmentIntensity = 1 }) {
+function GpuOpticalPreview({ model, material, ior, dispersion, birefringence = 0, opticAxisAzimuth = 0, opticAxisTilt = 0, gemColor, bodyColorStrength, colorZoneMode = 'uniform', zoneColorA = '#d84270', zoneColorB = '#23845f', zoneBoundary = .58, zoneRotation = 0, renderProfile, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environment = 'studio', background = 'charcoal', environmentRotation = 0, environmentIntensity = 1 }) {
   const canvasRef = useRef(null)
   const rendererRef = useRef(null)
+  const renderOptionsRef = useRef(null)
   const dragRef = useRef(null)
   const [fallback, setFallback] = useState(false)
+  const [renderProgress, setRenderProgress] = useState({ sample: 0, target: renderProfile.progressiveSamples, precision: '' })
+  const [renderDirty, setRenderDirty] = useState(true)
+  const [rendering, setRendering] = useState(false)
   const [cameraOrbit, setCameraOrbit] = useState({ yaw: .68, pitch: .62, distance: 8.6 })
   useEffect(() => {
     if (!canvasRef.current) return undefined
@@ -256,17 +329,34 @@ function GpuOpticalPreview({ model, ior, dispersion, birefringence = 0, opticAxi
     return () => { rendererRef.current?.destroy(); rendererRef.current = null }
   }, [])
   useEffect(() => {
-    if (!rendererRef.current || !model) return
-    try { rendererRef.current.draw({ model, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, spectralSamples: renderProfile.spectralSamples, gemColor, bodyColorStrength, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, bounces: renderProfile.bounces, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environmentPreset: OPTICAL_ENVIRONMENTS[environment]?.preset || 0, environmentRotation, environmentIntensity, cameraOrbit }) }
-    catch { setFallback(true) }
-  }, [model, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, gemColor, bodyColorStrength, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, renderProfile.bounces, renderProfile.spectralSamples, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environment, environmentRotation, environmentIntensity, cameraOrbit])
-  if (fallback) return <Canvas dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={{ position: [0, 8.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model, ior, dispersion, gemColor, bodyColorStrength }}/><ambientLight intensity={1.6}/><directionalLight position={[5,-9,6]} intensity={2.3}/><directionalLight position={[5,9,6]} intensity={1.4}/>{model && <RealisticGem model={model} renderProfile={renderProfile} {...{ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, facetFinishes, tierFinishes}} showAppearance={showAppearance}/>}<OrbitControls enableDamping/></Canvas>
-  return <canvas ref={canvasRef} className="gpu-optics-canvas interactive" aria-label="GPU 多次反射光学预览"
+    if (!model) return
+    rendererRef.current?.cancel()
+    setRendering(false)
+    setRenderDirty(true)
+    setRenderProgress({ sample: 0, target: renderProfile.progressiveSamples, precision: '' })
+    renderOptionsRef.current = { model, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, spectralSamples: renderProfile.spectralSamples, progressiveSamples: renderProfile.progressiveSamples, pixelRatioMax: renderProfile.pixelRatioMax, gemColor, bodyColorStrength, spectralAbsorption: materialAbsorptionSamples(material, gemColor, bodyColorStrength), colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, bounces: renderProfile.bounces, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environmentPreset: OPTICAL_ENVIRONMENTS[environment]?.preset || 0, backgroundColor: VIEW_BACKGROUNDS[background]?.color || VIEW_BACKGROUNDS.charcoal.color, environmentRotation, environmentIntensity, cameraOrbit }
+  }, [model, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, gemColor, bodyColorStrength, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, renderProfile.bounces, renderProfile.spectralSamples, renderProfile.progressiveSamples, renderProfile.pixelRatioMax, tierColors, facetColors, tierFinishes, facetFinishes, showAppearance, environment, background, environmentRotation, environmentIntensity, cameraOrbit])
+  const startOpticalRender = () => {
+    if (!rendererRef.current || !renderOptionsRef.current || rendering) return
+    setRendering(true); setRenderDirty(false)
+    setRenderProgress({ sample: 0, target: renderProfile.progressiveSamples, precision: '' })
+    try {
+      rendererRef.current.draw({ ...renderOptionsRef.current, onProgress: (sample, target, precision) => {
+        if (sample === 1 || sample === target || sample % 4 === 0) setRenderProgress({ sample, target, precision })
+        if (sample === target) setRendering(false)
+      } })
+    } catch { setRendering(false); setFallback(true) }
+  }
+  if (fallback) return <Canvas dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={{ position: [0, 8.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><color attach="background" args={[VIEW_BACKGROUNDS[background]?.color || VIEW_BACKGROUNDS.charcoal.color]}/><RenderSync revision={{ model, ior, dispersion, gemColor, bodyColorStrength, background }}/><ambientLight intensity={1.6}/><directionalLight position={[5,-9,6]} intensity={2.3}/><directionalLight position={[5,9,6]} intensity={1.4}/>{model && <RealisticGem model={model} renderProfile={renderProfile} {...{ior, dispersion, gemColor, bodyColorStrength, tierColors, facetColors, facetFinishes, tierFinishes}} showAppearance={showAppearance}/>}<OrbitControls enableDamping/></Canvas>
+  return <div className="gpu-optics-stage"><canvas ref={canvasRef} className="gpu-optics-canvas interactive" aria-label="GPU 多次反射光学预览"
     onPointerDown={event => { dragRef.current = { x: event.clientX, y: event.clientY, yaw: cameraOrbit.yaw, pitch: cameraOrbit.pitch }; event.currentTarget.setPointerCapture(event.pointerId) }}
     onPointerMove={event => { if (!dragRef.current) return; const start = dragRef.current; setCameraOrbit(current => ({ ...current, yaw: start.yaw - (event.clientX - start.x) * .009, pitch: Math.max(-1.3, Math.min(1.3, start.pitch + (event.clientY - start.y) * .009)) })) }}
     onPointerUp={event => { dragRef.current = null; event.currentTarget.releasePointerCapture?.(event.pointerId) }}
     onPointerCancel={() => { dragRef.current = null }}
     onWheel={event => { event.preventDefault(); setCameraOrbit(current => ({ ...current, distance: Math.max(5.2, Math.min(15, current.distance + event.deltaY * .008)) })) }}/>
+    <button className="manual-render-start" disabled={!model || rendering} onPointerDown={event => event.stopPropagation()} onClick={startOpticalRender}>{rendering ? '渲染中…' : renderDirty ? '开始渲染' : '重新渲染'}</button>
+    <span className={`render-convergence ${!renderDirty && !rendering && renderProgress.sample >= renderProgress.target ? 'ready' : ''}`}>{renderDirty ? '参数已变化 · 等待手动渲染' : rendering ? `${renderProgress.precision ? `${renderProgress.precision} · ` : ''}正在收敛 ${renderProgress.sample}/${renderProgress.target}` : `高质量渲染 · ${renderProgress.target} 采样 · ${renderProgress.precision}`}</span>
+  </div>
 }
 
 function configureJewelryRenderer({ gl }) {
@@ -364,6 +454,10 @@ function CuttingFeedback({ event }) {
 function DirectCutPlane({ control }) {
   const drag = useRef(null)
   const finishTimer = useRef(null)
+  const moveFrame = useRef(0)
+  const pendingMove = useRef(null)
+  const latestControl = useRef(control)
+  latestControl.current = control
   const { camera, size, invalidate } = useThree()
   const transform = useMemo(() => {
     if (!control?.event) return null
@@ -371,12 +465,14 @@ function DirectCutPlane({ control }) {
     return { position: normal.clone().multiplyScalar(control.event.d), quaternion: new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, 1), normal) }
   }, [control?.event])
   useEffect(() => { invalidate() }, [control?.enabled, control?.event, invalidate])
+  useEffect(() => () => { if (moveFrame.current) window.cancelAnimationFrame(moveFrame.current) }, [])
   if (!control?.enabled || !transform) return null
   const toolColor = control.tool === 'rough' ? '#ff9f43' : control.tool === 'polish' ? '#c58cff' : '#35d7ff'
   const pointerPosition = event => ({ x: event.clientX ?? event.nativeEvent?.clientX ?? 0, y: event.clientY ?? event.nativeEvent?.clientY ?? 0 })
-  const finish = () => { if (!drag.current) return; window.clearTimeout(finishTimer.current); drag.current = null; control.onEnd?.(); document.body.classList.remove('dragging-cut-plane') }
+  const flushMove = () => { moveFrame.current = 0; if (pendingMove.current === null) return; const delta = pendingMove.current; pendingMove.current = null; latestControl.current?.onMove?.(delta); invalidate() }
+  const finish = () => { if (!drag.current) return; window.clearTimeout(finishTimer.current); if (moveFrame.current) window.cancelAnimationFrame(moveFrame.current); flushMove(); drag.current = null; latestControl.current?.onEnd?.(); document.body.classList.remove('dragging-cut-plane') }
   const start = event => { event.stopPropagation(); const pointer = pointerPosition(event), normal = new THREE.Vector3(...control.event.n).normalize(), origin = normal.clone().multiplyScalar(control.event.d), projectedOrigin = origin.clone().project(camera), projectedTip = origin.clone().add(normal).project(camera), axisX = (projectedTip.x - projectedOrigin.x) * size.width / 2, axisY = -(projectedTip.y - projectedOrigin.y) * size.height / 2, pixelsPerUnit = Math.max(12, Math.hypot(axisX, axisY)); drag.current = { pointerId: event.pointerId, ...pointer, axisX: axisX / pixelsPerUnit, axisY: axisY / pixelsPerUnit, pixelsPerUnit }; event.target.setPointerCapture?.(event.pointerId); control.onStart?.(); document.body.classList.add('dragging-cut-plane'); window.addEventListener('pointerup', finish, { once: true }) }
-  const move = event => { if (!drag.current) return; event.stopPropagation(); const pointer = pointerPosition(event), alongAxis = (pointer.x - drag.current.x) * drag.current.axisX + (pointer.y - drag.current.y) * drag.current.axisY, precision = event.shiftKey ? .2 : 1; control.onMove?.(alongAxis / drag.current.pixelsPerUnit * precision); window.clearTimeout(finishTimer.current); finishTimer.current = window.setTimeout(finish, 180); invalidate() }
+  const move = event => { if (!drag.current) return; event.stopPropagation(); const pointer = pointerPosition(event), alongAxis = (pointer.x - drag.current.x) * drag.current.axisX + (pointer.y - drag.current.y) * drag.current.axisY, precision = event.shiftKey ? .2 : 1; pendingMove.current = alongAxis / drag.current.pixelsPerUnit * precision; if (!moveFrame.current) moveFrame.current = window.requestAnimationFrame(flushMove); window.clearTimeout(finishTimer.current); finishTimer.current = window.setTimeout(finish, 180) }
   const end = event => { if (!drag.current) return; event.stopPropagation(); event.target.releasePointerCapture?.(drag.current.pointerId); finish() }
   return <group position={transform.position} quaternion={transform.quaternion} renderOrder={12}>
     <mesh onPointerDown={start} onPointerMove={move} onPointerUp={end} onPointerCancel={end}><circleGeometry args={[1.75, 64]}/><meshBasicMaterial color={toolColor} transparent opacity={.2} depthWrite={false} side={THREE.DoubleSide}/></mesh>
@@ -385,65 +481,6 @@ function DirectCutPlane({ control }) {
     <mesh position={[0, 0, .48]} rotation={[Math.PI / 2, 0, 0]}><coneGeometry args={[.16, .36, 20]}/><meshBasicMaterial color="#ffe17a" depthWrite={false}/></mesh>
     <mesh position={[0, 0, -.48]} rotation={[-Math.PI / 2, 0, 0]}><coneGeometry args={[.16, .36, 20]}/><meshBasicMaterial color="#ffe17a" depthWrite={false}/></mesh>
   </group>
-}
-
-function CutGesturePad({ disabled, angle, depth, onStart, onMove, onEnd, onNudge, onLinearStart, onLinearAngle, onLinearDepth, onLinearEnd }) {
-  const drag = useRef(null)
-  const linearActive = useRef(false)
-  const [position, setPosition] = useState({ x: 0, y: 0 })
-  const [fineMode, setFineMode] = useState(false)
-  const startLinear = () => {
-    if (disabled || linearActive.current) return
-    linearActive.current = true
-    onLinearStart?.()
-  }
-  const finishLinear = () => {
-    if (!linearActive.current) return
-    linearActive.current = false
-    onLinearEnd?.()
-  }
-  const finish = event => {
-    if (!drag.current) return
-    event?.currentTarget?.releasePointerCapture?.(drag.current.pointerId)
-    drag.current = null
-    setPosition({ x: 0, y: 0 })
-    onEnd?.()
-  }
-  const start = event => {
-    if (disabled || event.button !== 0) return
-    event.preventDefault()
-    event.currentTarget.setPointerCapture?.(event.pointerId)
-    drag.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, axis: null }
-    onStart?.()
-  }
-  const move = event => {
-    if (!drag.current) return
-    event.preventDefault()
-    const rawX = event.clientX - drag.current.x
-    const rawY = event.clientY - drag.current.y
-    if (!drag.current.axis && Math.hypot(rawX, rawY) > 12) {
-      if (Math.abs(rawX) > Math.abs(rawY) * 1.35) drag.current.axis = 'x'
-      else if (Math.abs(rawY) > Math.abs(rawX) * 1.35) drag.current.axis = 'y'
-      else drag.current.axis = 'free'
-    }
-    const deltaX = drag.current.axis === 'y' ? 0 : rawX
-    const deltaY = drag.current.axis === 'x' ? 0 : rawY
-    setPosition({ x: Math.max(-92, Math.min(92, deltaX)), y: Math.max(-56, Math.min(56, deltaY)) })
-    onMove?.(deltaX, deltaY, fineMode || event.shiftKey)
-  }
-  return <div className={`cut-gesture ${disabled ? 'disabled' : ''}`}>
-    <div className="cut-gesture-readout"><span>侧栏切割片</span><b>{angle.toFixed(2)}° · 深度 {depth.toFixed(2)}</b></div>
-    <div className="linear-cut-control"><div><span>切割片进退</span><output>{depth.toFixed(2)}</output></div><input aria-label="切割片进退" type="range" min="-8" max="8" step="0.05" value={depth} onPointerDown={startLinear} onPointerUp={finishLinear} onPointerCancel={finishLinear} onFocus={startLinear} onBlur={finishLinear} onKeyDown={startLinear} onKeyUp={finishLinear} onChange={event => onLinearDepth?.(Number(event.target.value))}/><small>退刀　←　　　　　→　进刀</small></div>
-    <div className="linear-cut-control"><div><span>切割片角度</span><output>{Math.abs(angle).toFixed(2)}°</output></div><input aria-label="切割片角度" type="range" min="0.1" max="89.9" step="0.05" value={Math.abs(angle)} onPointerDown={startLinear} onPointerUp={finishLinear} onPointerCancel={finishLinear} onFocus={startLinear} onBlur={finishLinear} onKeyDown={startLinear} onKeyUp={finishLinear} onChange={event => onLinearAngle?.(Number(event.target.value))}/><small>平缓　←　　　　　→　陡峭</small></div>
-    <div className="gesture-nudges"><button onClick={() => onNudge?.(0, -.1)}>角度 −0.1°</button><button onClick={() => onNudge?.(0, .1)}>角度 +0.1°</button><button onClick={() => onNudge?.(-.1, 0)}>退刀 0.1</button><button onClick={() => onNudge?.(.1, 0)}>进刀 0.1</button></div>
-    <details className="gesture-advanced"><summary>二维联合滑动（高级）</summary><div className="gesture-mode" role="group" aria-label="滑动精度"><button className={!fineMode ? 'active' : ''} onClick={() => setFineMode(false)}>快速调整</button><button className={fineMode ? 'active' : ''} onClick={() => setFineMode(true)}>精细调整</button></div>
-      <div className="cut-gesture-pad" onPointerDown={start} onPointerMove={move} onPointerUp={finish} onPointerCancel={finish}>
-        <i className="gesture-axis horizontal">← 退刀　　　　　　进刀 →</i><i className="gesture-axis vertical">↑ 增大角度</i>
-        <div className="gesture-knob" style={{ transform: `translate(${position.x}px,${position.y}px)` }}>◆</div>
-      </div>
-      <small>斜向拖动可同时调整角度与进退</small>
-    </details>
-  </div>
 }
 
 function QuickCutDock({ open, disabled, tierName, facetNumber, scope, angle, depth, onClose, onScopeChange, onStart, onAngle, onDepth, onEnd, onNudge }) {
@@ -495,7 +532,7 @@ function GroovePathPad({ points, disabled, onChange, onBegin, onFinish }) {
 }
 
 function ModelViewport({ camera, label, model, modelProps, roughProps }) {
-  return <div className="model-viewport">{label && <span className="viewport-label">{label}</span>}<Canvas camera={camera} frameloop="demand"><RenderSync revision={{ model, modelProps, roughProps }}/><ambientLight intensity={1.35}/><hemisphereLight args={['#d9efff','#15283c',1.4]}/><directionalLight position={[5,8,6]} intensity={3}/><directionalLight position={[-5,2,-5]} intensity={1.4}/>{roughProps && <><RoughStone {...roughProps}/><DefectMarkers {...roughProps}/>{roughProps.cutFeedbackEnabled && <CuttingFeedback event={roughProps.cutFeedback}/>}<DirectCutPlane control={roughProps.directCut}/></>} {model && <><GemModel model={model} {...modelProps} onSelect={roughProps?.activeTool === 'select' ? modelProps.onSelect : undefined} onEdgeSelect={roughProps?.activeTool === 'select' ? modelProps.onEdgeSelect : undefined}/>{roughProps?.showOpticAxis && <OpticAxisGuide model={model} azimuth={roughProps.opticAxisAzimuth} tilt={roughProps.opticAxisTilt}/>}</>}<OrbitControls enableDamping enabled={roughProps?.activeTool === 'orbit' && !roughProps?.cutDragging}/></Canvas></div>
+  return <div className="model-viewport">{label && <span className="viewport-label">{label}</span>}<Canvas camera={camera} frameloop="demand"><RenderSync revision={{ model, modelProps, roughProps }}/><ambientLight intensity={1.35}/><hemisphereLight args={['#d9efff','#15283c',1.4]}/><directionalLight position={[5,8,6]} intensity={3}/><directionalLight position={[-5,2,-5]} intensity={1.4}/>{roughProps && <><RoughStone {...roughProps}/><DefectMarkers {...roughProps}/>{roughProps.cutFeedbackEnabled && <CuttingFeedback event={roughProps.cutFeedback}/>}<DirectCutPlane control={roughProps.directCut}/></>} {model && <><GemModel model={model} {...modelProps} onSelect={roughProps?.activeTool === 'select' ? modelProps.onSelect : undefined} onEdgeSelect={roughProps?.activeTool === 'select' ? modelProps.onEdgeSelect : undefined}/>{roughProps?.showOpticAxis && <OpticAxisGuide model={model} azimuth={roughProps.opticAxisAzimuth} tilt={roughProps.opticAxisTilt}/>} {roughProps?.raySegments?.length > 0 && <RayPathGuide segments={roughProps.raySegments}/>}</>}<OrbitControls enableDamping enabled={roughProps?.activeTool === 'orbit' && !roughProps?.cutDragging}/></Canvas></div>
 }
 
 function chooseInitialTier(design) {
@@ -504,7 +541,7 @@ function chooseInitialTier(design) {
 }
 
 function RayMap({ result }) {
-  return <><div className="ray-map" style={{ gridTemplateColumns: `repeat(${result.resolution},1fr)` }}>{result.samples.map((sample, index) => <i key={index} className={`ray-${sample}`}/>)}</div><div className="ray-legend"><span><i className="ray-1"/>返回</span><span><i className="ray-2"/>漏光</span><span><i className="ray-3"/>多次反射</span></div></>
+  return <><div className="ray-map" style={{ gridTemplateColumns: `repeat(${result.resolution},1fr)` }}>{result.samples.map((sample, index) => <i key={index} className={`ray-${sample}`}/>)}</div><div className="ray-legend"><span><i className="ray-1"/>回光占优</span><span><i className="ray-2"/>漏光占优</span><span><i className="ray-3"/>吸收 / 未收敛</span></div></>
 }
 
 function App() {
@@ -530,6 +567,9 @@ function App() {
   const [opticAxisAzimuth, setOpticAxisAzimuth] = useState(Number.isFinite(startup.opticAxisAzimuth) ? startup.opticAxisAzimuth : 0)
   const [opticAxisTilt, setOpticAxisTilt] = useState(Number.isFinite(startup.opticAxisTilt) ? startup.opticAxisTilt : 0)
   const [showOpticAxis, setShowOpticAxis] = useState(Boolean(startup.showOpticAxis))
+  const [showRayPath, setShowRayPath] = useState(false)
+  const [raySampleU, setRaySampleU] = useState(.18)
+  const [raySampleV, setRaySampleV] = useState(0)
   const [gemColor, setGemColor] = useState(startup.gemColor || MATERIALS.custom.color)
   const [finishedWidth, setFinishedWidth] = useState(startup.finishedWidth || 10)
   const [density, setDensity] = useState(startup.density || MATERIALS.custom.density)
@@ -563,6 +603,7 @@ function App() {
   const [previewMode, setPreviewMode] = useState('optical')
   const [renderDevice, setRenderDevice] = useState(['auto', 'mobile', 'desktop'].includes(startup.renderDevice) ? startup.renderDevice : 'auto')
   const [renderEnvironment, setRenderEnvironment] = useState(OPTICAL_ENVIRONMENTS[startup.renderEnvironment] ? startup.renderEnvironment : 'studio')
+  const [renderBackground, setRenderBackground] = useState(VIEW_BACKGROUNDS[startup.renderBackground] ? startup.renderBackground : 'charcoal')
   const [environmentRotation, setEnvironmentRotation] = useState(Number.isFinite(startup.environmentRotation) ? startup.environmentRotation : 0)
   const [environmentIntensity, setEnvironmentIntensity] = useState(Number.isFinite(startup.environmentIntensity) ? startup.environmentIntensity : 1)
   const [inspectorTab, setInspectorTab] = useState('facet')
@@ -608,7 +649,6 @@ function App() {
   const [patternStrength, setPatternStrength] = useState(1.5)
   const [patternFinish, setPatternFinish] = useState('alternate')
   const directCutStart = useRef(null)
-  const gestureCutStart = useRef(null)
   const linearCutStart = useRef(null)
   const viewerRef = useRef(null)
 
@@ -642,15 +682,21 @@ function App() {
 
   const selectedTier = design.tiers.find(tier => tier.id === selectedTierId) || design.tiers[0]
   const renderGemColor = tuneGemColor(gemColor, colorSaturation, colorBrightness)
+  const absorptionSpectrum = useMemo(() => createMaterialAbsorptionSpectrum(material, renderGemColor, bodyColorStrength), [material, renderGemColor, bodyColorStrength])
   const resolvedRenderDevice = resolveRenderDevice(renderDevice)
   const renderProfile = RENDER_PROFILES[resolvedRenderDevice]
   const selectedEdit = facetEdits[selectedTier?.id]?.[selectedFacet]
   const selectedAngle = selectedEdit?.angle ?? selectedTier?.angle ?? 0
   const selectedDepth = -(selectedEdit?.distanceDelta || 0) / .004
-  const modelResult = useMemo(() => {
-    try { return { model: buildGemFromDesign(design, facetEdits), error: '' } }
-    catch (error) { return { model: null, error: error.message } }
-  }, [design, facetEdits])
+  const modelResult = useGemGeometry(design, facetEdits)
+  const [analysisModel, setAnalysisModel] = useState(null)
+  useEffect(() => {
+    if (!modelResult.model || cutDragging) return undefined
+    const timer = window.setTimeout(() => setAnalysisModel(modelResult.model), analysisModel ? 180 : 0)
+    return () => window.clearTimeout(timer)
+  }, [modelResult.model, cutDragging])
+  const settledModel = analysisModel || modelResult.model
+  const analysisUpdating = Boolean(cutDragging || modelResult.pending || (analysisModel && modelResult.model && analysisModel !== modelResult.model))
   const selectedModelFacet = modelResult.model?.facets.find(facet => facet.tier.id === selectedTier?.id && facet.facetIndex === selectedFacet)
   const patternGroups = [...new Set(design.tiers.map(tier => tier.patternGroup).filter(Boolean))]
   const latestPatternGroup = patternGroups.at(-1)
@@ -716,8 +762,10 @@ function App() {
   const critical = criticalAngle(ior)
   const leakage = leakageAssessment(pavilionAngle, ior)
   const measures = useMemo(() => modelResult.model ? measureGem(modelResult.model) : null, [modelResult.model])
-  const raytrace = useMemo(() => modelResult.model ? traceFaceUp(modelResult.model, ior, 21, 16) : null, [modelResult.model, ior])
-  const multiAngleTrace = useMemo(() => modelResult.model ? traceMultiAngle(modelResult.model, ior, { resolution: 11, maxBounces: 16 }) : null, [modelResult.model, ior])
+  const raytrace = useMemo(() => settledModel ? traceFaceUp(settledModel, ior, 21, 16, { dispersion, spectralSamples: 9, spectralSampling: 'adaptive', absorptionSpectrum, acceptanceDegrees: 25, illuminant: 'd65' }) : null, [settledModel, ior, dispersion, absorptionSpectrum])
+  const opticalEvaluation = useMemo(() => settledModel ? evaluateOpticalPerformance(settledModel, ior, { dispersion, absorptionSpectrum }) : null, [settledModel, ior, dispersion, absorptionSpectrum])
+  const multiAngleTrace = opticalEvaluation?.trace || null
+  const diagnosticRay = useMemo(() => settledModel ? traceDiagnosticRay(settledModel, ior, { u: raySampleU, v: raySampleV, maxBounces: 16, dispersion, spectralSamples: 9, absorptionSpectrum, acceptanceDegrees: 25, illuminant: 'd65' }) : null, [settledModel, ior, dispersion, absorptionSpectrum, raySampleU, raySampleV])
   const modelScale = measures ? finishedWidth / measures.width : 0
   const selectedEdgeLengthMm = selectedModelFacet?.points?.length && modelScale
     ? Math.hypot(...selectedModelFacet.points[Math.min(selectedEdge, selectedModelFacet.points.length - 1)].map((value, axis) => value - selectedModelFacet.points[(Math.min(selectedEdge, selectedModelFacet.points.length - 1) + 1) % selectedModelFacet.points.length][axis])) * modelScale
@@ -736,9 +784,9 @@ function App() {
   const roughVolume = rough.length * rough.width * rough.height * (rough.shape === 'scan' && roughMesh ? roughMesh.volumeFactor : ROUGH_SHAPES[rough.shape].volumeFactor)
   const finishedVolume = measures ? measures.volume * modelScale ** 3 : 0
   const roughYield = roughVolume > 0 ? Math.min(100, finishedVolume / roughVolume * 100) : 0
-  const roughFit = useMemo(() => evaluateRoughFit(modelResult.model, modelScale, rough, roughMesh), [modelResult.model, modelScale, rough, roughMesh])
-  const defectReport = useMemo(() => evaluateDefects(modelResult.model, modelScale, rough, defects), [modelResult.model, modelScale, rough, defects])
-  const productionReport = useMemo(() => modelResult.model && measures ? validateForProduction(design, modelResult.model, measures, roughFit, defectReport, { modelScale, finishedWidth }) : null, [design, modelResult.model, measures, roughFit, defectReport, modelScale, finishedWidth])
+  const roughFit = useMemo(() => evaluateRoughFit(settledModel, modelScale, rough, roughMesh), [settledModel, modelScale, rough, roughMesh])
+  const defectReport = useMemo(() => evaluateDefects(settledModel, modelScale, rough, defects), [settledModel, modelScale, rough, defects])
+  const productionReport = useMemo(() => settledModel && measures ? validateForProduction(design, settledModel, measures, roughFit, defectReport, { modelScale, finishedWidth }) : null, [design, settledModel, measures, roughFit, defectReport, modelScale, finishedWidth])
   const viewCamera = viewMode === 'top' ? { position: [0, 11.5, .01], up: [0, 0, -1], fov: 34 } : viewMode === 'side' ? { position: [11.5, 0, .01], up: [0, 1, 0], fov: 34 } : { position: [6.5, 4.5, 7.5], fov: 38 }
   const renderedHiddenTiers = useMemo(() => {
     const next = { ...hiddenTiers }
@@ -755,7 +803,7 @@ function App() {
     onMove: moveDirectCut,
     onEnd: endDirectCut,
   }
-  const roughProps = { settings: rough, modelScale, customMesh: roughMesh, defects, defectReport, cutFeedbackEnabled: cutFeedbackEnabled && !directCutMode, cutFeedback, directCut, cutDragging, activeTool, showOpticAxis: showOpticAxis && birefringence > 0, opticAxisAzimuth, opticAxisTilt }
+  const roughProps = { settings: rough, modelScale, customMesh: roughMesh, defects, defectReport, cutFeedbackEnabled: cutFeedbackEnabled && !directCutMode, cutFeedback, directCut, cutDragging, activeTool, showOpticAxis: showOpticAxis && birefringence > 0, opticAxisAzimuth, opticAxisTilt, raySegments: showRayPath && diagnosticRay?.hit ? diagnosticRay.segments : [] }
   const selectedDefect = defects.find(defect => defect.id === selectedDefectId) || defects[0]
 
   useEffect(() => { setIndexDraft(selectedTier?.indexes.join(' ') || '') }, [selectedTierId, selectedTier?.indexes])
@@ -764,12 +812,12 @@ function App() {
     setAutosaveStatus('保存中…')
     const timer = window.setTimeout(() => {
       try {
-        localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, environmentRotation, environmentIntensity, savedAt: Date.now() }))
+        localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, renderBackground, environmentRotation, environmentIntensity, savedAt: Date.now() }))
         setAutosaveStatus('已自动保存')
       } catch { setAutosaveStatus('自动保存失败') }
     }, 500)
     return () => window.clearTimeout(timer)
-  }, [design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, environmentRotation, environmentIntensity])
+  }, [design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, renderBackground, environmentRotation, environmentIntensity])
   useEffect(() => {
     const index = design.tiers.findIndex(tier => tier.id === selectedTierId)
     if (index >= 0) setCuttingStep(index)
@@ -1122,8 +1170,7 @@ function App() {
     setFacetEdits(current => {
       const tierEdits = { ...(current[start.tierId] || {}) }
       start.targets.forEach(index => { tierEdits[index] = { ...(tierEdits[index] || {}), distanceDelta: start.distances[index] + rawDelta } })
-      const next = { ...current, [start.tierId]: tierEdits }
-      try { buildGemFromDesign(design, next); return next } catch { return current }
+      return { ...current, [start.tierId]: tierEdits }
     })
   }
 
@@ -1133,45 +1180,6 @@ function App() {
     directCutStart.current = null
     setCutDragging(false)
     setImportStatus(`已用${CUT_TOOLS[cutTool].name}调整 ${faceCount === 1 ? `${selectedTier.name} No.${selectedFacet + 1}` : `${selectedTier.name}全部 ${faceCount} 面`}；可用撤销恢复`)
-  }
-
-  function beginGestureCut() {
-    if (!modelResult.model || meetLocked) return
-    checkpoint()
-    const targets = cutScope === 'tier' ? selectedTier.indexes.map((_, index) => index) : [selectedFacet]
-    gestureCutStart.current = {
-      tierId: selectedTier.id,
-      targets,
-      values: Object.fromEntries(targets.map(index => [index, {
-        angle: facetEdits[selectedTier.id]?.[index]?.angle ?? selectedTier.angle,
-        distanceDelta: facetEdits[selectedTier.id]?.[index]?.distanceDelta || 0,
-      }])),
-    }
-    setCutDragging(true)
-    setCutFeedback(null)
-  }
-
-  function moveGestureCut(deltaX, deltaY, fine) {
-    const start = gestureCutStart.current
-    if (!start) return
-    setFacetEdits(current => {
-      const tierEdits = { ...(current[start.tierId] || {}) }
-      start.targets.forEach(index => {
-        const initial = start.values[index]
-        const next = calculateGestureCut(initial.angle, initial.distanceDelta, deltaX, deltaY, { sensitivity: CUT_TOOLS[cutTool].sensitivity, fine })
-        tierEdits[index] = { ...(tierEdits[index] || {}), angle: next.angle, distanceDelta: next.distanceDelta }
-      })
-      const next = { ...current, [start.tierId]: tierEdits }
-      try { buildGemFromDesign(design, next); return next } catch { return current }
-    })
-  }
-
-  function endGestureCut() {
-    if (!gestureCutStart.current) return
-    const count = gestureCutStart.current.targets.length
-    gestureCutStart.current = null
-    setCutDragging(false)
-    setImportStatus(`滑动切割已完成：${count === 1 ? '当前刻面' : `整层 ${count} 面`}；左右调整切深、上下调整角度`)
   }
 
   function nudgeGestureCut(depthDelta, angleDelta) {
@@ -1229,8 +1237,7 @@ function App() {
           tierEdits[index] = { ...prior, distanceDelta: Math.round(distanceDelta * 100000) / 100000 }
         }
       })
-      const next = { ...current, [start.tierId]: tierEdits }
-      try { buildGemFromDesign(design, next); return next } catch { return current }
+      return { ...current, [start.tierId]: tierEdits }
     })
   }
 
@@ -1249,16 +1256,6 @@ function App() {
     setCutDragging(false)
     directCutStart.current = null
     document.body.classList.remove('dragging-cut-plane')
-  }
-
-  function applyCutAngle(angle) {
-    if (cutScope === 'single') { updateSelectedAngle(angle); return }
-    checkpoint()
-    setFacetEdits(current => {
-      const tierEdits = { ...(current[selectedTier.id] || {}) }
-      selectedTier.indexes.forEach((_, index) => { tierEdits[index] = { ...(tierEdits[index] || {}), angle } })
-      return { ...current, [selectedTier.id]: tierEdits }
-    })
   }
 
   function rotateCutDirection(step) {
@@ -1301,14 +1298,14 @@ function App() {
     setImportStatus(sourceFormat === 'ASC' ? '已恢复导入时设计' : '已恢复 GEM 原始设计')
   }
 
-  function saveWorkspaceNow() { try { localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, environmentRotation, environmentIntensity, savedAt: Date.now() })); setAutosaveStatus('已手动保存'); setImportStatus('当前工作区已保存到本机浏览器') } catch { setAutosaveStatus('保存失败'); setImportStatus('工作区保存失败：浏览器存储空间可能不足') } }
+  function saveWorkspaceNow() { try { localStorage.setItem('gem-cut-designer-workspace', JSON.stringify({ design, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor, bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, defects, sourceFormat, currentLibraryId, renderDevice, renderEnvironment, renderBackground, environmentRotation, environmentIntensity, savedAt: Date.now() })); setAutosaveStatus('已手动保存'); setImportStatus('当前工作区已保存到本机浏览器') } catch { setAutosaveStatus('保存失败'); setImportStatus('工作区保存失败：浏览器存储空间可能不足') } }
 
   function exportProjectFile() {
     try {
       const workspace = {
         design, originalDesign, facetEdits, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers,
         originalAppearance, selectedTierId, selectedFacet, material, ior, dispersion, birefringence, opticAxisAzimuth, opticAxisTilt, showOpticAxis, gemColor,
-        bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, roughMesh, defects, sourceFormat, renderDevice, renderEnvironment, environmentRotation, environmentIntensity,
+        bodyColorStrength, colorSaturation, colorBrightness, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, facetPalette, previewColors, finishedWidth, density, rough, roughMesh, defects, sourceFormat, renderDevice, renderEnvironment, renderBackground, environmentRotation, environmentIntensity,
       }
       downloadText(serializeProject(workspace), `${safeDesignName()}.gcut`, 'application/json;charset=utf-8')
       setImportStatus('已导出完整 .gcut 项目；可在其他电脑继续编辑')
@@ -1368,6 +1365,7 @@ function App() {
       setCurrentLibraryId('')
       setRenderDevice(['auto', 'mobile', 'desktop'].includes(workspace.renderDevice) ? workspace.renderDevice : 'auto')
       setRenderEnvironment(OPTICAL_ENVIRONMENTS[workspace.renderEnvironment] ? workspace.renderEnvironment : 'studio')
+      setRenderBackground(VIEW_BACKGROUNDS[workspace.renderBackground] ? workspace.renderBackground : 'charcoal')
       setEnvironmentRotation(Number.isFinite(workspace.environmentRotation) ? workspace.environmentRotation : 0)
       setEnvironmentIntensity(Number.isFinite(workspace.environmentIntensity) ? workspace.environmentIntensity : 1)
       setHistory({ past: [], future: [] })
@@ -1744,16 +1742,17 @@ function App() {
   }
 
   return <div className="app">
-    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 6.16 · Docked Cut Controls</div></div></header>
+    <header className="header"><div><h1>宝石智能琢型设计系统</h1><p>Gemstone Intelligent Cut Designer</p></div><div className="header-status"><span>{autosaveStatus}</span><div className="version">Prototype 6.25 · Spectral Materials</div></div></header>
     <main className={`workspace mobile-${mobileWorkspaceTab}`}>
       <aside className="panel controls"><div className="sidebar-tabs"><button className={leftTab === 'design' ? 'active' : ''} onClick={() => setLeftTab('design')}>设计</button><button className={leftTab === 'rough' ? 'active' : ''} onClick={() => setLeftTab('rough')}>原石</button><button className={leftTab === 'material' ? 'active' : ''} onClick={() => setLeftTab('material')}>材料</button><button className={leftTab === 'output' ? 'active' : ''} onClick={() => setLeftTab('output')}>输出</button></div>
         <details className="project-actions"><summary><span>项目操作</span><small>{autosaveStatus}</small></summary><div><button onClick={saveWorkspaceNow}>保存到本浏览器</button><button onClick={exportProjectFile}>导出完整项目</button><label className="project-file-button">打开项目<input type="file" accept=".gcut,application/json" onChange={importProjectFile}/></label><button onClick={restoreDesign}>恢复当前设计</button><button onClick={undo} disabled={!history.past.length}>撤销修改</button></div></details>
-        {leftTab === 'material' && <><div className="panel-heading"><h2>材料与外观</h2><span>IOR {ior.toFixed(3)}</span></div>
+        {leftTab === 'material' && <><div className="panel-heading"><h2>宝石材料与外观</h2><span>IOR {ior.toFixed(3)}</span></div>
         <label>宝石材料</label><select value={material} onChange={e => { const key = e.target.value; const next = MATERIALS[key]; setMaterial(key); setIor(next.ior); setDispersion(next.dispersion); setBirefringence(next.birefringence); setDensity(next.density); setGemColor(next.color); setBodyColorStrength(next.colorStrength); setColorSaturation(1); setColorBrightness(1) }}>{MATERIAL_GROUPS.map(group => <optgroup key={group.id} label={group.name}>{Object.entries(MATERIALS).filter(([, value]) => value.group === group.id).map(([key, value]) => <option key={key} value={key}>{value.name}</option>)}</optgroup>)}</select>
+        <div className="crystal-summary"><div><span>晶系</span><strong>{MATERIALS[material].crystalSystem}</strong></div><div><span>光性</span><strong>{OPTICAL_CLASSES[MATERIALS[material].opticalClass].name}</strong></div></div>
         <label>实际折射率（IOR）</label><input aria-label="折射率" type="number" min="1.01" max="3" step="0.001" value={ior} onChange={e => setIor(Math.min(3, Math.max(1.01, Number(e.target.value))))} />
         <div className="compact-grid"><div><label>色散值</label><input aria-label="色散值" type="number" min="0" max=".25" step=".001" value={dispersion} onChange={event => setDispersion(Math.max(0, Math.min(.25, Number(event.target.value))))}/></div><div><label>双折射差</label><input aria-label="双折射差" type="number" min="0" max=".2" step=".001" value={birefringence} onChange={event => setBirefringence(Math.max(0, Math.min(.2, Number(event.target.value))))}/></div></div>
-        <div className="material-optics-note"><strong>{MATERIALS[material].optical}</strong><span>折射率范围 {MATERIALS[material].range} · 色散 {dispersion.toFixed(3)}{birefringence > 0 ? ` · 双折射 ${birefringence.toFixed(3)}` : ' · 无明显双折射'}</span></div>
-        {birefringence > 0 && <details className="advanced-editor"><summary>晶轴方向与视图显示</summary><label className="visibility-toggle"><input type="checkbox" checked={showOpticAxis} onChange={event => setShowOpticAxis(event.target.checked)}/> 在主视图显示晶轴</label><label>晶轴方位：{opticAxisAzimuth.toFixed(0)}°</label><input aria-label="晶轴方位" type="range" min="0" max="360" step="1" value={opticAxisAzimuth} onChange={event => setOpticAxisAzimuth(Number(event.target.value))}/><label>晶轴倾角：{opticAxisTilt.toFixed(0)}°</label><input aria-label="晶轴倾角" type="range" min="0" max="90" step="1" value={opticAxisTilt} onChange={event => setOpticAxisTilt(Number(event.target.value))}/><p className="legend">青色双向箭头代表晶体光轴，仅用于方向参考，不会成为刻面或导出到机器文件。</p></details>}
+        <div className="material-optics-note"><strong>{MATERIALS[material].optical}</strong><span>折射率范围 {MATERIALS[material].range} · 色散 {dispersion.toFixed(3)}{birefringence > 0 ? ` · 双折射 ${birefringence.toFixed(3)}` : ' · 无明显双折射'}</span><span>体色使用材料光谱工程模型；后续可替换为实测吸收曲线。</span></div>
+        <details className="advanced-editor crystal-optics"><summary>晶体光学（随宝石自动设置）</summary><div className="crystal-optics-status"><strong>{MATERIALS[material].crystalSystem} · {OPTICAL_CLASSES[MATERIALS[material].opticalClass].name}</strong><span>{OPTICAL_CLASSES[MATERIALS[material].opticalClass].description}</span></div>{MATERIALS[material].opticalClass === 'isotropic' ? <p className="legend compact-legend">各向同性材料不显示晶轴；折射与全反射使用上方实际折射率计算。</p> : <><label className="visibility-toggle"><input type="checkbox" checked={showOpticAxis} onChange={event => setShowOpticAxis(event.target.checked)}/> 在主视图显示{OPTICAL_CLASSES[MATERIALS[material].opticalClass].axisLabel}</label><label>{OPTICAL_CLASSES[MATERIALS[material].opticalClass].axisLabel}方位：{opticAxisAzimuth.toFixed(0)}°</label><input aria-label="晶轴方位" type="range" min="0" max="360" step="1" value={opticAxisAzimuth} onChange={event => setOpticAxisAzimuth(Number(event.target.value))}/><label>{OPTICAL_CLASSES[MATERIALS[material].opticalClass].axisLabel}倾角：{opticAxisTilt.toFixed(0)}°</label><input aria-label="晶轴倾角" type="range" min="0" max="90" step="1" value={opticAxisTilt} onChange={event => setOpticAxisTilt(Number(event.target.value))}/><p className="legend compact-legend">青色双向箭头仅用于方向参考，不会成为刻面或导出到机器文件。双轴宝石目前显示一个主轴参考方向，完整三轴折射率张量将在后续光学内核中实现。</p></>}</details>
         <label>宝石体色</label><div className="gem-color-presets">{GEM_COLOR_PRESETS.map(preset => <button key={preset.id} className={gemColor.toLowerCase() === preset.color ? 'active' : ''} title={preset.name} onClick={() => { setGemColor(preset.color); setBodyColorStrength(preset.strength); setColorSaturation(1); setColorBrightness(1) }}><i style={{ background: preset.color }}/><span>{preset.name}</span></button>)}</div>
         <div className="color-control"><input aria-label="宝石颜色" type="color" value={gemColor} onChange={e => setGemColor(e.target.value)}/><span>基础色 {gemColor.toUpperCase()}</span><i className="final-color-chip" style={{ background: renderGemColor }}/></div>
         <label>真实体色浓度：{Math.round(bodyColorStrength * 100)}%</label><input type="range" min="0" max="1" step=".01" value={bodyColorStrength} onChange={event => setBodyColorStrength(Number(event.target.value))}/>
@@ -1764,10 +1763,12 @@ function App() {
         <div className="color-mode-note"><strong>{previewColors ? '教学分面配色' : '真实体色预览'}</strong><span>{previewColors ? '已指定颜色的刻面会覆盖宝石体色，仅用于识别切割层。' : '使用中性黑白摄影棚，颜色按体色浓度减弱，不叠加选面标记。'}</span></div>
         <label>教学分层配色</label><div className="palette-apply"><select value={facetPalette} onChange={event => setFacetPalette(event.target.value)}>{Object.entries(FACET_PALETTES).map(([id, palette]) => <option key={id} value={id}>{palette.name}</option>)}</select><button onClick={() => { checkpoint(); setTierColors(createTierPalette(design, facetPalette)); setPreviewColors(true); setImportStatus(`已应用${FACET_PALETTES[facetPalette].name}分层配色`) }}>应用到图层</button></div>
         <label>GPU渲染设备</label><select value={renderDevice} onChange={event => setRenderDevice(event.target.value)}><option value="auto">自动检测（当前：{renderProfile.label}）</option><option value="mobile">手机端 · 流畅省电</option><option value="desktop">电脑端 · 高质量</option></select>
-        <div className="render-profile-note"><strong>{renderProfile.label}模式</strong><span>{renderProfile.bounces} 次内部反射 · {renderProfile.spectralSamples} 波段色散 · {renderProfile.spectralSamples >= 5 ? '双光路追踪' : '双折射快速近似'} · 最高 {renderProfile.dpr[1]}× 像素密度</span></div>
+        <div className="render-profile-note"><strong>{renderProfile.label}模式</strong><span>{renderProfile.bounces} 次内部反射 · {renderProfile.spectralSamples} 波段 {renderProfile.spectralSamples >= 5 ? 'CIE D65 光谱合成' : '快速色散'} · {renderProfile.spectralSamples >= 5 ? '双光路追踪' : '双折射快速近似'} · {renderProfile.progressiveSamples > 1 ? `${renderProfile.progressiveSamples} 次渐进采样 · 线性 HDR 累积` : '单帧快速预览'} · 最高 {renderProfile.dpr[1]}× 像素密度</span></div>
         <label>光学摄影棚</label><select aria-label="光学摄影棚" value={renderEnvironment} onChange={event => setRenderEnvironment(event.target.value)}>{Object.entries(OPTICAL_ENVIRONMENTS).map(([id, item]) => <option key={id} value={id}>{item.name}</option>)}</select>
+        <label>观察背景（不参与折射）</label><div className="background-swatches">{Object.entries(VIEW_BACKGROUNDS).map(([id, item]) => <button key={id} className={renderBackground === id ? 'active' : ''} onClick={() => setRenderBackground(id)} title={item.name}><i style={{ background: item.color }}/><span>{item.name}</span></button>)}</div>
         <label>灯光方向：{environmentRotation.toFixed(0)}°</label><input aria-label="灯光方向" type="range" min="-180" max="180" step="1" value={environmentRotation} onChange={event => setEnvironmentRotation(Number(event.target.value))}/>
         <label>环境亮度：{Math.round(environmentIntensity * 100)}%</label><input aria-label="环境亮度" type="range" min=".25" max="2.5" step=".05" value={environmentIntensity} onChange={event => setEnvironmentIntensity(Number(event.target.value))}/>
+        <div className="material-optics-note"><strong>{renderEnvironment === 'daylight' ? 'CIE D65 · 约 6504 K' : '中性摄影棚照明'}</strong><span>照明只参与宝石反射与折射；{VIEW_BACKGROUNDS[renderBackground].name}背景独立显示，不再给宝石造成彩色视觉干扰。D65 固定评价结果不受此处显示设置影响。</span></div>
         <div className="color-mode-note"><strong>可交互光学视角</strong><span>在效果窗拖动可旋转观察；滚轮可缩放。灯光方向与视角互相独立。</span></div>
         <div className="compact-grid"><div><label>成品宽度（mm）</label><input type="number" min="0.1" max="1000" step="0.1" value={finishedWidth} onChange={e => setFinishedWidth(Math.max(.1, Number(e.target.value)))}/></div><div><label>密度（g/cm³）</label><input type="number" min="0.1" max="30" step="0.01" value={density} onChange={e => setDensity(Math.max(.1, Number(e.target.value)))}/></div></div>
         {measures && <div className="summary-card"><span>预计成品</span><strong>{(measures.length * modelScale).toFixed(2)} × {finishedWidth.toFixed(2)} × {(measures.depth * modelScale).toFixed(2)} mm</strong><small>约 {estimatedCarats.toFixed(2)} ct</small></div>}</>}
@@ -1839,15 +1840,15 @@ function App() {
           <div className="floating-tools-title" onPointerDown={startFloatingToolsDrag}><span>⋮⋮</span><b>常用工具</b><small>拖动</small><button onPointerDown={event => event.stopPropagation()} onClick={() => setViewToolsOpen(current => !current)} aria-label={viewToolsOpen ? '收起常用工具' : '展开常用工具'}>{viewToolsOpen ? '−' : '＋'}</button></div>
           {viewToolsOpen && <><nav className="floating-tool-modes" aria-label="工作工具"><button className={activeTool === 'select' ? 'active' : ''} onClick={() => setActiveTool('select')} title="选择刻面 (S)"><b>◇</b><span>选择</span></button><button className={activeTool === 'orbit' ? 'active' : ''} onClick={() => setActiveTool('orbit')} title="旋转视图 (O)"><b>↻</b><span>旋转</span></button><button className={activeTool === 'cut' ? 'active cut' : ''} disabled={!selectedModelFacet || meetLocked} onClick={toggleDirectCut} title="直接切割 (C)"><b>◩</b><span>切割</span></button></nav><div className="floating-view-modes"><button className={viewMode === 'perspective' ? 'active' : ''} onClick={() => setViewMode('perspective')}>透视</button><button className={viewMode === 'top' ? 'active' : ''} onClick={() => setViewMode('top')}>俯视</button><button className={viewMode === 'side' ? 'active' : ''} onClick={() => setViewMode('side')}>侧视</button><button className={viewMode === 'quad' ? 'active' : ''} onClick={() => setViewMode('quad')}>四视</button></div><div className="floating-tool-actions"><button onClick={undo} disabled={!history.past.length}>撤销</button><button onClick={redo} disabled={!history.future.length}>重做</button><button className={wireframe ? 'active' : ''} onClick={() => setWireframe(current => !current)}>线稿</button><button className={assistantOpen ? 'active' : ''} onClick={() => setAssistantOpen(current => !current)}>步骤</button><button className={previewOpen ? 'active' : ''} onClick={() => { setPreviewOpen(current => !current); setMobileWorkspaceTab('result') }}>效果</button></div></>}
         </div>
-        {directCutMode && <div className={`direct-cut-hint ${cutDragging ? 'dragging' : ''}`}><b>{cutDragging ? '正在重算刻面交点' : '直接切割工具'}</b><span>{cutDragging ? '松开即可完成；按住 Shift 可精细移动' : '抓住蓝色切割片，沿黄色箭头拖动 · Shift 精调'}</span></div>}
+        {directCutMode && <div className={`direct-cut-hint ${cutDragging ? 'dragging' : ''}`}><b>{cutDragging ? '后台更新刻面交点' : '直接切割工具'}</b><span>{cutDragging ? '页面操作保持响应；松开后刷新完整光学结果' : '抓住蓝色切割片，沿黄色箭头拖动 · Shift 精调'}</span></div>}
         {viewMode === 'quad' ? <div className="quad-view"><ModelViewport label="俯视 / Crown" camera={{ position:[0,11.5,.01], up:[0,0,-1], fov:34 }} model={workingModel} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectedEdge, selectionScope: cutScope, ior, gemColor: renderGemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet, onEdgeSelect: setSelectedEdge }}/><ModelViewport label="侧视 / Side" camera={{ position:[11.5,0,.01], up:[0,1,0], fov:34 }} model={workingModel} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectedEdge, selectionScope: cutScope, ior, gemColor: renderGemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet, onEdgeSelect: setSelectedEdge }}/><ModelViewport label="端视 / End" camera={{ position:[.01,0,11.5], up:[0,1,0], fov:34 }} model={workingModel} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectedEdge, selectionScope: cutScope, ior, gemColor: renderGemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet, onEdgeSelect: setSelectedEdge }}/><ModelViewport label="亭部 / Pavilion" camera={{ position:[0,-11.5,.01], up:[0,0,1], fov:34 }} model={workingModel} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectedEdge, selectionScope: cutScope, ior, gemColor: renderGemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet, onEdgeSelect: setSelectedEdge }}/></div> : <ModelViewport key={viewMode} camera={viewCamera} model={workingModel} roughProps={roughProps} modelProps={{ selectedTierId, selectedFacet, selectedEdge, selectionScope: cutScope, ior, gemColor: renderGemColor, tierColors, facetColors, tierFinishes, facetFinishes, hiddenTiers: renderedHiddenTiers, wireframe, onSelect: selectFacet, onEdgeSelect: setSelectedEdge }}/>} 
         {assistantOpen && <div className="cutting-assistant"><button onClick={() => goToCuttingStep(cuttingStep - 1)} disabled={cuttingStep === 0}>‹</button><div><span>切磨步骤 {cuttingStep + 1} / {design.tiers.length}</span><strong>{activeCuttingTier.name} · {activeCuttingTier.angle.toFixed(2)}°</strong><small>齿号 {activeCuttingTier.indexes.join(' · ')}</small></div><button onClick={() => goToCuttingStep(cuttingStep + 1)} disabled={cuttingStep === design.tiers.length - 1}>›</button><label><input type="checkbox" checked={hideFutureTiers} onChange={event => setHideFutureTiers(event.target.checked)}/> 隐藏后续层</label></div>}
-        <div className="viewport-status"><span className={`tool-state ${activeTool}`}>{groovePreviewEnabled ? groovePlacement === 'path' ? '自由路径预览' : grooveTool === 'round' ? '圆头刀预览' : 'V 槽预览' : edgePreviewEnabled ? '倒角预览' : activeTool === 'select' ? '选择工具' : activeTool === 'orbit' ? '旋转工具' : '直接切割'}</span><span>{selectedTier.name} · {cutScope === 'tier' ? `整层 ${selectedTier.indexes.length} 面已选` : `面 ${selectedFacet + 1}`}</span><span>{groovePreviewEnabled ? `槽宽 ${vGrooveWidth.toFixed(2)}%` : edgePreviewEnabled ? `进刀约 ${edgeBevelOffsetMm.toFixed(3)} mm` : `角度 ${selectedAngle.toFixed(2)}°`}</span><span>切深 {selectedDepth.toFixed(2)}</span><em className={modelResult.error || edgeBevelPreview.error || groovePreview.error ? 'error' : ''}>{groovePreview.error || edgeBevelPreview.error ? '预览无效' : groovePreviewEnabled || edgePreviewEnabled ? '尚未应用' : modelResult.error ? '几何错误' : '几何有效'}</em></div>
+        <div className="viewport-status"><span className={`tool-state ${activeTool}`}>{groovePreviewEnabled ? groovePlacement === 'path' ? '自由路径预览' : grooveTool === 'round' ? '圆头刀预览' : 'V 槽预览' : edgePreviewEnabled ? '倒角预览' : activeTool === 'select' ? '选择工具' : activeTool === 'orbit' ? '旋转工具' : '直接切割'}</span><span>{selectedTier.name} · {cutScope === 'tier' ? `整层 ${selectedTier.indexes.length} 面已选` : `面 ${selectedFacet + 1}`}</span><span>{groovePreviewEnabled ? `槽宽 ${vGrooveWidth.toFixed(2)}%` : edgePreviewEnabled ? `进刀约 ${edgeBevelOffsetMm.toFixed(3)} mm` : `角度 ${selectedAngle.toFixed(2)}°`}</span><span>切深 {selectedDepth.toFixed(2)}</span><em className={modelResult.error || edgeBevelPreview.error || groovePreview.error ? 'error' : ''}>{modelResult.pending ? '后台更新' : groovePreview.error || edgeBevelPreview.error ? '预览无效' : groovePreviewEnabled || edgePreviewEnabled ? '尚未应用' : modelResult.error ? '几何错误' : '几何有效'}</em></div>
       </section>
 
-      <aside className="panel result">{previewOpen && <div className="effect-window"><div className="effect-title"><div><span>效果预览</span><small>{previewMode === 'cut' ? `${selectedTier.angle < -1 ? '亭部' : '冠部'}刻面 · 粉色高亮新纹路` : `${renderProfile.label} · 拖动旋转 · 滚轮缩放`}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
+      <aside className="panel result">{previewOpen && <div className="effect-window"><div className="effect-title"><div><span>效果预览</span><small>{analysisUpdating ? '几何实时更新 · 松手后刷新光学' : previewMode === 'cut' ? `${selectedTier.angle < -1 ? '亭部' : '冠部'}刻面 · 粉色高亮新纹路` : `${renderProfile.label} · 拖动旋转 · 滚轮缩放`}</small></div><button aria-label="隐藏效果预览" onClick={() => setPreviewOpen(false)}>隐藏</button></div>
           <div className="effect-mode-tabs"><button className={previewMode === 'cut' ? 'active' : ''} onClick={() => setPreviewMode('cut')}>刻面纹路</button><button className={previewMode === 'optical' ? 'active' : ''} onClick={() => setPreviewMode('optical')}>光学近似</button></div>
-          <div className="effect-canvas realistic">{previewMode === 'optical' ? <GpuOpticalPreview model={modelResult.model} renderProfile={renderProfile} ior={ior} dispersion={dispersion} birefringence={birefringence} opticAxisAzimuth={opticAxisAzimuth} opticAxisTilt={opticAxisTilt} gemColor={renderGemColor} bodyColorStrength={bodyColorStrength} colorZoneMode={colorZoneMode} zoneColorA={zoneColorA} zoneColorB={zoneColorB} zoneBoundary={zoneBoundary} zoneRotation={zoneRotation} tierColors={tierColors} facetColors={facetColors} facetFinishes={facetFinishes} tierFinishes={tierFinishes} showAppearance={previewColors} environment={renderEnvironment} environmentRotation={environmentRotation} environmentIntensity={environmentIntensity}/> : <Canvas key={`${previewMode}-${selectedTier.angle < -1 ? 'pavilion' : 'crown'}`} dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={selectedTier.angle < -1 ? { position: [0, -7, .01], up: [0, 0, -1], fov: 42 } : { position: [0, 8.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><RenderSync revision={{ model: modelResult.model, ior, dispersion, renderGemColor, bodyColorStrength, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, tierColors, facetColors, tierFinishes, facetFinishes, previewColors, previewMode, resolvedRenderDevice }}/><ambientLight intensity={1.6}/><directionalLight position={[5,-9,6]} intensity={2.3}/><directionalLight position={[5,9,6]} intensity={1.4}/>{modelResult.model && <GemModel model={modelResult.model} technicalPreview focusPatternGroup={latestPatternGroup} ior={ior} gemColor={renderGemColor} tierColors={previewColors ? tierColors : {}} facetColors={previewColors ? facetColors : {}} tierFinishes={tierFinishes} facetFinishes={facetFinishes}/>}<OrbitControls enableDamping/></Canvas>}</div>
+          <div className="effect-canvas realistic">{previewMode === 'optical' ? <GpuOpticalPreview model={settledModel} material={material} renderProfile={renderProfile} ior={ior} dispersion={dispersion} birefringence={birefringence} opticAxisAzimuth={opticAxisAzimuth} opticAxisTilt={opticAxisTilt} gemColor={renderGemColor} bodyColorStrength={bodyColorStrength} colorZoneMode={colorZoneMode} zoneColorA={zoneColorA} zoneColorB={zoneColorB} zoneBoundary={zoneBoundary} zoneRotation={zoneRotation} tierColors={tierColors} facetColors={facetColors} facetFinishes={facetFinishes} tierFinishes={tierFinishes} showAppearance={previewColors} environment={renderEnvironment} background={renderBackground} environmentRotation={environmentRotation} environmentIntensity={environmentIntensity}/> : <Canvas key={`${previewMode}-${selectedTier.angle < -1 ? 'pavilion' : 'crown'}`} dpr={renderProfile.dpr} gl={{ antialias: true, powerPreference: 'high-performance' }} onCreated={configureJewelryRenderer} camera={selectedTier.angle < -1 ? { position: [0, -7, .01], up: [0, 0, -1], fov: 42 } : { position: [0, 8.5, .01], up: [0, 0, -1], fov: 42 }} frameloop="demand"><color attach="background" args={[VIEW_BACKGROUNDS[renderBackground].color]}/><RenderSync revision={{ model: settledModel, ior, dispersion, renderGemColor, bodyColorStrength, colorZoneMode, zoneColorA, zoneColorB, zoneBoundary, zoneRotation, tierColors, facetColors, tierFinishes, facetFinishes, previewColors, previewMode, resolvedRenderDevice, renderBackground }}/><ambientLight intensity={1.6}/><directionalLight position={[5,-9,6]} intensity={2.3}/><directionalLight position={[5,9,6]} intensity={1.4}/>{settledModel && <GemModel model={settledModel} technicalPreview focusPatternGroup={latestPatternGroup} ior={ior} gemColor={renderGemColor} tierColors={previewColors ? tierColors : {}} facetColors={previewColors ? facetColors : {}} tierFinishes={tierFinishes} facetFinishes={facetFinishes}/>}<OrbitControls enableDamping/></Canvas>}</div>
         </div>}<div className="inspector-tabs"><button className={inspectorTab === 'facet' ? 'active' : ''} onClick={() => setInspectorTab('facet')}>刻面</button><button className={inspectorTab === 'pattern' ? 'active' : ''} onClick={() => setInspectorTab('pattern')}>纹路</button><button className={inspectorTab === 'girdle' ? 'active' : ''} onClick={() => setInspectorTab('girdle')}>腰围</button><button className={inspectorTab === 'optics' ? 'active' : ''} onClick={() => setInspectorTab('optics')}>光学</button><button className={inspectorTab === 'measure' ? 'active' : ''} onClick={() => setInspectorTab('measure')}>比例</button><button className={inspectorTab === 'check' ? 'active' : ''} onClick={() => setInspectorTab('check')}>检查</button></div>
         {inspectorTab === 'facet' && <><div className="panel-heading"><h2>刻面与图层</h2><span>{selectedTier.name} · No.{selectedFacet + 1}</span></div>
         <div className={`design-mode ${design.symmetryFolds === 1 && !design.symmetryMirror ? 'free' : ''}`}><div><span>设计模式</span><strong>{design.symmetryFolds === 1 && !design.symmetryMirror ? '自由不对称' : `${design.symmetryFolds} 重对称${design.symmetryMirror ? ' · 镜像' : ''}`}</strong></div>{!(design.symmetryFolds === 1 && !design.symmetryMirror) && <button onClick={enableFreeDesign}>解除对称</button>}</div>
@@ -1862,14 +1863,13 @@ function App() {
           <label>当前刻面表面效果</label><select value={facetFinishes[selectedTier.id]?.[selectedFacet] || 'inherit'} onChange={event => setFacetFinish(event.target.value)}><option value="inherit">跟随本层</option><option value="polished">单面光面抛光</option><option value="frosted">单面磨砂</option></select>
         </details>
         {selectedTier.code === 'F' && <div className="status-card fireworks-card"><span>8 射线烟花强调层</span><small>本层 8 面在亭尖形成星芒。用“整层对称面”可一起拖动切深；表面可切换光面暗星或磨砂烟花效果。</small></div>}
-        <div className="cut-workbench"><div className="cut-workbench-title"><div><strong>切割工作台</strong><span>{cutScope === 'single' ? '只调整当前刻面' : `联动本层 ${selectedTier.indexes.length} 个对称面`}</span></div><button className={activeTool === 'cut' ? 'active' : ''} onClick={toggleDirectCut}>{activeTool === 'cut' ? '结束切割' : '模型上拖动'}</button></div>
+        <div className="cut-workbench"><div className="cut-workbench-title"><div><strong>切割工具设置</strong><span>角度、进退与联动范围在模型旁统一调整</span></div><button className={activeTool === 'cut' ? 'active' : ''} onClick={toggleDirectCut}>{activeTool === 'cut' ? '结束切割' : '模型上拖动'}</button></div>
           <div className="cut-workbench-tabs"><button className={cutWorkbenchTab === 'facet' ? 'active' : ''} onClick={() => setCutWorkbenchTab('facet')}>刻面切割</button><button className={cutWorkbenchTab === 'edge' ? 'active' : ''} onClick={() => setCutWorkbenchTab('edge')}>棱边修磨</button><button className={cutWorkbenchTab === 'groove' ? 'active' : ''} onClick={() => setCutWorkbenchTab('groove')}>凹槽刀</button></div>
           {cutWorkbenchTab === 'facet' && <div className="cut-workbench-pane">
-          <label>切割范围</label><div className="cut-scope"><button className={cutScope === 'single' ? 'active' : ''} onClick={() => setCutScope('single')}>当前单面</button><button className={cutScope === 'tier' ? 'active' : ''} onClick={() => setCutScope('tier')}>整层对称面</button></div>
+          <div className="cut-control-handoff"><div><strong>当前切割参数</strong><span>{Math.abs(selectedAngle).toFixed(2)}° · 深度 {selectedDepth.toFixed(2)} · {cutScope === 'single' ? '当前面' : `整层 ${selectedTier.indexes.length} 面`}</span></div><button disabled={quickCutOpen} onClick={() => setQuickCutOpen(true)}>{quickCutOpen ? '已显示在模型旁' : '打开快捷切割'}</button><small>日常滑动与 0.1 微调集中在模型旁，观察刻面的同时即可调整。</small></div>
           <div className="compact-grid"><div><label>切割工具</label><select value={cutTool} onChange={event => setCutTool(event.target.value)}>{Object.entries(CUT_TOOLS).map(([key, tool]) => <option key={key} value={key}>{tool.name}</option>)}</select></div><div><label>移动方式</label><select value={cutDirection} onChange={event => setCutDirection(event.target.value)}><option value="in">向内进刀</option><option value="out">向外退刀</option><option value="free">双向调整</option></select></div></div>
-          <div className="compact-grid"><div><label>切割角度</label><input type="number" min="-90" max="90" step="0.05" value={selectedAngle} onChange={event => applyCutAngle(Number(event.target.value))}/></div><div><label>当前方向（齿位）</label><input type="number" min="0" max={design.gear} step="1" value={selectedTier.indexes[selectedFacet]} onChange={event => updateSelectedIndex(event.target.value)}/></div></div>
+          <div className="cut-direction-field"><label>当前方向（齿位）</label><input type="number" min="0" max={design.gear} step="1" value={selectedTier.indexes[selectedFacet]} onChange={event => updateSelectedIndex(event.target.value)}/></div>
           <div className="cut-direction-buttons"><button onClick={() => rotateCutDirection(-1)}>↶ 逆时针 1 齿</button><button onClick={() => rotateCutDirection(1)}>顺时针 1 齿 ↷</button></div>
-          <CutGesturePad disabled={!selectedModelFacet || meetLocked} angle={selectedAngle} depth={selectedDepth} onStart={beginGestureCut} onMove={moveGestureCut} onEnd={endGestureCut} onNudge={nudgeGestureCut} onLinearStart={beginLinearCut} onLinearAngle={value => moveLinearCut('angle', value)} onLinearDepth={value => moveLinearCut('depth', value)} onLinearEnd={endLinearCut}/>
           </div>}
           {cutWorkbenchTab === 'edge' && <div className="edge-bevel-tool"><div><strong>棱边倒角 / 修磨</strong><span>沿所选刻面的边新增真实切割平面</span></div>
             <div className="edge-pick-hint">可直接点击模型上的蓝色棱边；粉色表示当前目标</div>
@@ -1945,10 +1945,11 @@ function App() {
         <div className={`risk ${leakage.level}`}><span>亭部漏光风险</span><strong>{leakage.label}</strong><p>{leakage.detail}</p></div>
         <div className="compact-grid"><button className="secondary primary-action" disabled={optimizing || !modelResult.model} onClick={() => runAngleOptimization('pavilion')}>{optimizing ? '正在分析…' : '推荐亭角'}</button><button className="secondary primary-action" disabled={optimizing || !modelResult.model} onClick={() => runAngleOptimization('crown')}>{optimizing ? '正在分析…' : '推荐冠角'}</button></div>
         {optimization && <div className="optimizer-card"><div><span>推荐{optimization.section === 'crown' ? '冠部' : '亭部'}整体调整</span><strong>{optimization.best.delta >= 0 ? '+' : ''}{optimization.best.delta.toFixed(2)}°</strong></div><div className="optimizer-metrics"><span>多视角返回光<br/><b>{optimization.baseline.trace.returnPercent.toFixed(1)}% → {optimization.best.trace.returnPercent.toFixed(1)}%</b></span><span>多视角漏光<br/><b>{optimization.baseline.trace.leakagePercent.toFixed(1)}% → {optimization.best.trace.leakagePercent.toFixed(1)}%</b></span></div><small>已比较 {optimization.tested} 个方案；每个方案综合正面与四个 12° 倾斜方向，角度变化时同步修正中心距以近似保持腰围交线。结果用于设计筛选，正式加工前仍需样石验证。</small><button className="secondary" disabled={Math.abs(optimization.best.delta) < .001} onClick={applyAngleOptimization}>{Math.abs(optimization.best.delta) < .001 ? '当前已是搜索范围内最佳' : '应用推荐方案'}</button></div>}
-        {multiAngleTrace && <><h2 className="section-title">多视角综合表现</h2><Result label="分析方向" value={`${multiAngleTrace.viewCount} 个 · 正面 + 12° 四方向`}/><Result label="综合返回光" value={`${multiAngleTrace.returnPercent.toFixed(1)}%`}/><Result label="综合漏光" value={`${multiAngleTrace.leakagePercent.toFixed(1)}%`}/><Result label="返回方向集中度" value={`${(multiAngleTrace.averageReturnAlignment * 100).toFixed(1)}%`}/></>}
+        {opticalEvaluation && <><h2 className="section-title">固定条件光学评价</h2><div className="evaluation-protocol"><strong>{opticalEvaluation.protocol.name}</strong><span>CIE D65 · 约 {opticalEvaluation.protocol.illuminantCctK} K · 正面、12°及24°共 {multiAngleTrace.viewCount} 个方向 · {opticalEvaluation.protocol.spectralSamples} 波段 · {opticalEvaluation.protocol.acceptanceDegrees}°接收锥</span><small>这是本软件用于方案横向比较的固定研究协议，不等同于GIA、AGS或其他机构的正式切工分级。</small></div><Result label="D65 白光内部回光" value={`${opticalEvaluation.whiteLightReturnPercent.toFixed(1)}%`}/><Result label="漏光能量" value={`${opticalEvaluation.leakagePercent.toFixed(1)}%`}/><Result label="体色吸收" value={`${opticalEvaluation.absorbedPercent.toFixed(1)}%`}/><Result label="入射面反射" value={`${opticalEvaluation.surfaceReflectionPercent.toFixed(1)}%`}/><Result label="多角度一致性" value={`${opticalEvaluation.viewConsistencyPercent.toFixed(1)}%`}/><Result label="视角回光标准差" value={`${opticalEvaluation.returnStdDev.toFixed(2)} 个百分点`}/><Result label="视角回光极差" value={`${opticalEvaluation.returnRange.toFixed(2)} 个百分点`}/><Result label="光谱回光极差（火彩代理）" value={`${opticalEvaluation.spectralReturnRange.toFixed(2)} 个百分点`}/><Result label="返回方向集中度" value={`${(multiAngleTrace.averageReturnAlignment * 100).toFixed(1)}%`}/><details className="spectral-breakdown"><summary>查看波长相关折射率与回光</summary><div>{Object.values(multiAngleTrace.spectral).sort((a, b) => a.wavelengthNm - b.wavelengthNm).map(channel => <p key={channel.wavelengthNm}><span>{channel.wavelengthNm} nm</span><b>n {channel.ior.toFixed(4)}</b><em>回光 {channel.returnPercent.toFixed(1)}%</em></p>)}</div><small>折射率由材料 d 线折射率与 F–C 色散值拟合二项 Cauchy 曲线，白光结果按 CIE D65 相对光谱功率加权；属于工程近似，不替代实测光谱。</small></details></>}
         <p className="legend">冠部还需结合台面大小、冠高、星刻面与上腰面、腰厚及材料色散综合评估；目前推荐只搜索冠部刻面层的整体角度变化，其他比例见“比例”页。</p>
-        {raytrace && <><h2 className="section-title">面朝上光线追踪</h2><RayMap result={raytrace}/><Result label="有效入射光线" value={String(raytrace.entered)}/><Result label="返回光" value={`${raytrace.returnPercent.toFixed(1)}%`}/><Result label="漏光" value={`${raytrace.leakagePercent.toFixed(1)}%`}/><Result label="多次反射未收敛" value={`${raytrace.trappedPercent.toFixed(1)}%`}/><Result label="平均内部反射" value={`${raytrace.averageReflections.toFixed(2)} 次`}/><Result label="光线计算加速" value={raytrace.acceleration === 'bvh' ? `BVH · ${raytrace.bvhStats?.triangles ?? 0} 三角面` : '逐面计算'}/></>}
-        <p className="disclaimer">线稿热图显示垂直面朝上入射；综合评分另加入四个 12° 倾斜方向。分析采用理想抛光界面，尚未计入观察者头影和实际抛光损耗。</p></>}
+        {raytrace && <><h2 className="section-title">面朝上能量光线追踪</h2><RayMap result={raytrace}/><Result label="有效入射光线" value={String(raytrace.entered)}/><Result label="内部回光能量" value={`${raytrace.returnPercent.toFixed(1)}%`}/><Result label="漏光能量" value={`${raytrace.leakagePercent.toFixed(1)}%`}/><Result label="体色吸收" value={`${raytrace.absorbedPercent.toFixed(1)}%`}/><Result label="截断 / 未收敛" value={`${raytrace.trappedPercent.toFixed(1)}%`}/><Result label="入射面反射" value={`${raytrace.surfaceReflectionPercent.toFixed(1)}%`}/><Result label="平均内部反射" value={`${raytrace.averageReflections.toFixed(2)} 次`}/><Result label="平均内部光程" value={`${raytrace.averagePathLength.toFixed(2)} 模型单位`}/><Result label="能量守恒校验" value={`${raytrace.energyConservationPercent.toFixed(2)}%`}/><Result label="光谱采样" value={`自适应 3–${raytrace.spectralSamples} 波段 · 平均 ${raytrace.averageSpectralSamples.toFixed(1)}`}/><Result label="光谱加密区域" value={`${raytrace.refinedSamplePercent.toFixed(1)}% · 色散 ${dispersion.toFixed(3)}`}/><Result label="光线计算加速" value={raytrace.acceleration === 'bvh' ? `BVH · ${raytrace.bvhStats?.triangles ?? 0} 三角面` : '逐面计算'}/></>}
+        <div className="ray-path-inspector"><div><strong>代表光线路径</strong><label className="visibility-toggle"><input type="checkbox" checked={showRayPath} onChange={event => setShowRayPath(event.target.checked)}/> 在主视图显示</label></div><label>横向采样位置：{raySampleU.toFixed(2)}</label><input aria-label="光线横向采样位置" type="range" min="-.8" max=".8" step=".02" value={raySampleU} onChange={event => setRaySampleU(Number(event.target.value))}/><label>纵向采样位置：{raySampleV.toFixed(2)}</label><input aria-label="光线纵向采样位置" type="range" min="-.8" max=".8" step=".02" value={raySampleV} onChange={event => setRaySampleV(Number(event.target.value))}/>{diagnosticRay?.hit ? <><div className="ray-path-summary"><span>内部反射 {diagnosticRay.reflections} 次 · 全反射 {diagnosticRay.tirEvents} 次</span><small>绿线为返回观察方向，红线为漏光，黄线为宝石内部路径，白线为入射面反射。</small></div><details><summary>查看逐次界面事件（{diagnosticRay.events.length}）</summary><div className="ray-event-list">{diagnosticRay.events.map(event => <div key={`${event.index}-${event.facetIndex}`}><b>{event.index}. {event.type === 'entry' ? '进入宝石' : event.type === 'tir' ? '全反射' : '菲涅尔分光'}</b><span>{event.facet} · 反射 {(event.reflectance * 100).toFixed(1)}% · 透射 {(event.transmitted * 100).toFixed(1)}%</span></div>)}</div></details></> : <div className="ray-path-summary warning">当前采样位置未命中宝石，请移动采样滑块。</div>}</div>
+        <p className="disclaimer">光线与真实三角刻面逐次求交；每个界面按非偏振菲涅尔公式分配反射和透射能量，并计算斯涅尔折射、全反射、Beer–Lambert 体吸收及可见光谱色散。交互预览按路径差异在 3–9 波段间自适应采样，固定评价始终使用完整 9 波段；回光采用与入射反方向 25° 接收锥统计，尚未计入观察者头影、偏振和实际抛光缺陷。</p></>}
 
         {inspectorTab === 'measure' && <><div className="panel-heading"><h2>尺寸与比例</h2><span>成品宽度 {finishedWidth.toFixed(1)} mm</span></div>{measures && <>
           <Result label="长宽比 L/W" value={measures.lengthToWidth.toFixed(3)}/><Result label="总深比 H/W" value={`${(measures.depthToWidth * 100).toFixed(1)}%`}/><Result label="冠高比 C/W" value={`${(measures.crownToWidth * 100).toFixed(1)}%`}/><Result label="亭深比 P/W" value={`${(measures.pavilionToWidth * 100).toFixed(1)}%`}/><Result label="腰厚比 G/W" value={`${(measures.girdleToWidth * 100).toFixed(1)}%`}/><Result label="体积比 V/W³" value={measures.volumeToWidthCubed.toFixed(3)}/><Result label="预计重量" value={`${estimatedCarats.toFixed(2)} ct`}/>
